@@ -1,0 +1,4 @@
+FROM foundationpose:latest
+
+RUN /opt/conda/envs/my/bin/python3 -m pip install pyrealsense2 && \
+    /opt/conda/envs/my/bin/python3 -m pip install -U "ultralytics>=8.3.0" --no-deps

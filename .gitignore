@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Outputs / debug
+outputs/
+realtime_foundation/outputs/
+FoundationPose/debug/
+
+# Data / weights
+data/
+weights/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Build
+build/
+dist/
+*.egg-info/
+FoundationPose/mycpp/build/
+FoundationPose/bundlesdf/mycuda/build/
+
+# Editor/system
+.vscode/
+.DS_Store
+
+# FoundationPose large demo/model files
+FoundationPose/demo_data/**/*.zip
+FoundationPose/weights/
+FoundationPose/.git/

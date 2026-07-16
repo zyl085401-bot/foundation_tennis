@@ -1,0 +1,79 @@
+camera:
+  width: 640
+  height: 480
+  fps: 60
+  serial: null
+  depth_min: 0.001
+  depth_max: 3.0
+
+yolo:
+  weights: realtime_foundation/yolo_weights/best.pt
+  target_class: null
+  target_class_id: 0
+  conf: 0.75
+  imgsz: 640
+  device: cuda:0
+  half: true
+  min_mask_area: 100
+  morph_kernel: 5
+
+foundationpose:
+  mesh_file: FoundationPose/demo_data/cup0708/mesh/textured_simple.obj
+  debug_dir: realtime_foundation/outputs/debug
+  debug: 1
+  use_float32_crop_window_patch: true
+
+  init_min_n_views: 30  # 40
+  init_inplane_step: 60 # 60
+
+  est_refine_iter: 3
+
+  init_strategy: topk_two_stage    # topk_two_stage
+  
+  coarse_refine_iter: 1
+
+  coarse_score_filter: geometry
+  coarse_score_top_k: 48
+  
+  fine_refine_iter: 2
+  fine_top_k: 16
+
+  track_refine_iter: 2
+  vis_mode: contour  # box or contour
+  contour_thickness: 3
+  axis_scale: 0.1
+
+runtime:
+  mode: init_only       # init_only: 每次只做 YOLO + FoundationPose register；realtime: 初始化后进入 tracking。
+  success_timing_only: true # true: 只在初始化成功后打印阶段耗时统计，屏蔽等待/拒绝等普通日志。
+  timing_summary_format: table
+  detection_interval: 5    # 开始 tracking 后，每隔多少帧运行一次 YOLO 检查目标是否还在。
+  # relocalize_iou: 0.25
+  min_valid_depth_pixels: 500
+  max_missing_detections: 2 # YOLO 连续多少次检查不到目标，才认为目标真的消失
+  min_detection_conf: 0.7
+  min_detection_area: 14000
+  max_detection_area: 90000
+  detection_roi_xyxy: null
+  min_mask_median_depth: 0.15
+  max_mask_median_depth: 2.0
+  status_log_interval: 30
+  register_retry_interval: 30
+
+  register_required_stable_detections: 2
+  register_max_area_change: 0.35
+  register_border_margin: 40
+  register_min_render_iou: 0.82
+  register_max_translation_drift: 0.0  #这功能没用上，等搞完了一起决定要不要删掉
+  
+  show_window: true
+  save_init_vis: true
+  save_init_vis_dir: realtime_foundation/outputs/debug/init_vis
+  save_init_diagnostics: true
+  save_init_diagnostics_dir: realtime_foundation/outputs/debug/init_diagnostics
+  pose_output: realtime_foundation/outputs/latest_pose.txt
+  loop_sleep: 0.0
+
+
+#说真的有一个很大的问题，这些修改会不会影响到后面的追踪环节呢
+
