@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 
 import cv2
@@ -133,6 +136,18 @@ class FoundationPoseRealtimeTracker:
       coarse_score_top_k: int = 999999,
       fine_refine_iter: int = 2,
       fine_top_k: int = 16,
+      axis_prior_filter: str = "none",
+      axis_prior_model_axis: tuple[float, float, float] = (0.0, 0.0, 1.0),
+      axis_prior_max_angle_deg: float = 45.0,
+      axis_prior_min_candidates: int = 12,
+      axis_prior_max_candidates: int = 0,
+      axis_prior_min_points: int = 500,
+      axis_prior_min_confidence: float = 1.4,
+      axis_prior_visualization_enabled: bool = False,
+      axis_prior_visualization_dir: str | None = None,
+      axis_prior_visualization_top_n: int = 24,
+      axis_prior_visualization_boundary_margin: int = 6,
+      axis_prior_visualization_max_records: int = 20,
       track_refine_iter: int = 2,
       vis_mode: str = "box",
       contour_thickness: int = 3,
@@ -154,6 +169,20 @@ class FoundationPoseRealtimeTracker:
     self.coarse_score_top_k = coarse_score_top_k
     self.fine_refine_iter = fine_refine_iter
     self.fine_top_k = fine_top_k
+    self.axis_prior_filter = axis_prior_filter
+    self.axis_prior_model_axis = axis_prior_model_axis
+    self.axis_prior_max_angle_deg = axis_prior_max_angle_deg
+    self.axis_prior_min_candidates = axis_prior_min_candidates
+    self.axis_prior_max_candidates = axis_prior_max_candidates
+    self.axis_prior_min_points = axis_prior_min_points
+    self.axis_prior_min_confidence = axis_prior_min_confidence
+    self.axis_prior_visualization_enabled = axis_prior_visualization_enabled
+    self.axis_prior_visualization_dir = axis_prior_visualization_dir or os.path.join(debug_dir, "axis_prior_debug")
+    self.axis_prior_visualization_top_n = max(1, axis_prior_visualization_top_n)
+    self.axis_prior_visualization_boundary_margin = max(0, axis_prior_visualization_boundary_margin)
+    self.axis_prior_visualization_max_records = max(0, axis_prior_visualization_max_records)
+    self._axis_prior_visualization_run_id = time.strftime("run_%Y%m%d_%H%M%S")
+    self._axis_prior_visualization_count = 0
     self.track_refine_iter = track_refine_iter
     self.vis_mode = vis_mode
     self.contour_thickness = contour_thickness
@@ -209,7 +238,20 @@ class FoundationPoseRealtimeTracker:
         coarse_score_top_k=self.coarse_score_top_k,
         fine_refine_iter=self.fine_refine_iter,
         fine_top_k=self.fine_top_k,
+        axis_prior_filter=self.axis_prior_filter,
+        axis_prior_model_axis=self.axis_prior_model_axis,
+        axis_prior_max_angle_deg=self.axis_prior_max_angle_deg,
+        axis_prior_min_candidates=self.axis_prior_min_candidates,
+        axis_prior_max_candidates=self.axis_prior_max_candidates,
+        axis_prior_min_points=self.axis_prior_min_points,
+        axis_prior_min_confidence=self.axis_prior_min_confidence,
+        axis_prior_debug=self.axis_prior_visualization_enabled,
     )
+    if self.axis_prior_visualization_enabled:
+      try:
+        self._save_axis_prior_visualization(color, K, mask)
+      except Exception:
+        logging.exception("Failed to save axis-prior candidate visualization")
     self.initialized = True
     self.last_pose = pose
     return PoseResult(pose=pose, initialized=True, mode="register")
@@ -239,6 +281,210 @@ class FoundationPoseRealtimeTracker:
     )
     return (render_depth[0].detach().cpu().numpy() > 0.001).astype(np.uint8)
 
+  def _render_pose_masks(self, K: np.ndarray, image_shape: tuple[int, int], poses: np.ndarray) -> np.ndarray:
+    K = np.ascontiguousarray(K, dtype=np.float32)
+    poses = np.ascontiguousarray(poses, dtype=np.float32).reshape(-1, 4, 4)
+    height, width = image_shape[:2]
+    ob_in_cams = torch.as_tensor(poses, device="cuda", dtype=torch.float32)
+    _, render_depth, _ = nvdiffrast_render(
+        K=K,
+        H=height,
+        W=width,
+        ob_in_cams=ob_in_cams,
+        glctx=self.glctx,
+        mesh_tensors=self.estimator.mesh_tensors,
+        output_size=np.asarray([height, width]),
+        use_light=False,
+    )
+    return (render_depth.detach().cpu().numpy() > 0.001).astype(np.uint8)
+
+  def _save_axis_prior_visualization(self, color: np.ndarray, K: np.ndarray, target_mask: np.ndarray) -> None:
+    if self._axis_prior_visualization_count >= self.axis_prior_visualization_max_records:
+      return
+    diagnostics = getattr(self.estimator, "last_axis_prior_diagnostics", None)
+    if not diagnostics:
+      logging.warning("Axis-prior visualization skipped because no valid PCA diagnostics were produced")
+      return
+
+    poses = np.asarray(diagnostics["poses_before"], dtype=np.float32)
+    ranked = np.asarray(diagnostics["ranked_indices"], dtype=np.int64)
+    kept_indices = np.asarray(diagnostics["kept_indices"], dtype=np.int64)
+    kept_set = set(int(index) for index in kept_indices)
+    kept_ranked = np.asarray([index for index in ranked if int(index) in kept_set], dtype=np.int64)
+    top_indices = ranked[:min(self.axis_prior_visualization_top_n, len(ranked))]
+    kept_count = len(kept_indices)
+    margin = self.axis_prior_visualization_boundary_margin
+    boundary_start = max(0, kept_count - margin)
+    boundary_end = min(len(ranked), kept_count + margin)
+    boundary_indices = ranked[boundary_start:boundary_end]
+
+    selected_indices = list(dict.fromkeys(
+        [int(index) for index in np.concatenate((top_indices, boundary_indices, kept_ranked))]
+    ))
+    if not selected_indices:
+      return
+    masks = self._render_pose_masks(K, color.shape[:2], poses[selected_indices])
+    mask_by_index = {index: masks[position] for position, index in enumerate(selected_indices)}
+    rank_by_index = {int(index): rank for rank, index in enumerate(ranked, start=1)}
+    target = np.asarray(target_mask, dtype=np.uint8) > 0
+    iou_by_index = {}
+    for index in selected_indices:
+      rendered = mask_by_index[index] > 0
+      intersection = int(np.logical_and(rendered, target).sum())
+      union = int(np.logical_or(rendered, target).sum())
+      iou_by_index[index] = float(intersection / union) if union > 0 else 0.0
+    tf_to_centered_mesh = np.asarray(
+        self.estimator.get_tf_to_centered_mesh().detach().cpu().numpy(),
+        dtype=np.float32,
+    ).reshape(4, 4)
+
+    def make_tile(index: int) -> np.ndarray:
+      centered_pose = poses[index]
+      output_pose = centered_pose @ tf_to_centered_mesh
+      center_pose = output_pose @ np.linalg.inv(self.to_origin)
+      vis = np.ascontiguousarray(color, dtype=np.uint8).copy()
+      vis[target] = (0.65 * vis[target] + 0.35 * np.array([255, 0, 0])).astype(np.uint8)
+      contour_mask = mask_by_index[index] * 255
+      contours, _ = cv2.findContours(contour_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+      is_kept = index in kept_set
+      status_color = (0, 255, 0) if is_kept else (255, 0, 0)
+      if contours:
+        cv2.drawContours(vis, contours, -1, color=status_color, thickness=self.contour_thickness, lineType=cv2.LINE_AA)
+      vis = draw_xyz_axis(
+          vis,
+          ob_in_cam=center_pose,
+          scale=self.axis_scale,
+          K=K,
+          thickness=3,
+          transparency=0,
+          is_input_rgb=True,
+      )
+      angle = float(diagnostics["angles_deg"][index])
+      alignment = float(diagnostics["alignment"][index])
+      angle_passed = bool(diagnostics["angle_pass_mask"][index])
+      lines = [
+          f"rank={rank_by_index[index]} angle={angle:.2f} deg",
+          f"align={alignment:.4f} mask_iou={iou_by_index[index]:.3f}",
+          f"{'KEEP' if is_kept else 'DROP'} angle_pass={'Y' if angle_passed else 'N'}",
+      ]
+      for line_number, text in enumerate(lines):
+        y = 28 + line_number * 26
+        cv2.putText(vis, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(vis, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.60, status_color, 1, cv2.LINE_AA)
+      cv2.rectangle(vis, (1, 1), (vis.shape[1] - 2, vis.shape[0] - 2), status_color, 4)
+      return vis
+
+    tile_by_index = {index: make_tile(index) for index in selected_indices}
+
+    def make_image_contact_sheet(images, columns: int = 4, thumbnail_width: int = 320) -> np.ndarray:
+      if not images:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+      source_height, source_width = images[0].shape[:2]
+      thumbnail_height = max(1, int(round(source_height * thumbnail_width / source_width)))
+      rows = (len(images) + columns - 1) // columns
+      sheet = np.zeros((rows * thumbnail_height, columns * thumbnail_width, 3), dtype=np.uint8)
+      for position, image in enumerate(images):
+        thumbnail = cv2.resize(image, (thumbnail_width, thumbnail_height), interpolation=cv2.INTER_AREA)
+        row, column = divmod(position, columns)
+        sheet[row * thumbnail_height:(row + 1) * thumbnail_height,
+              column * thumbnail_width:(column + 1) * thumbnail_width] = thumbnail
+      return sheet
+
+    def make_contact_sheet(indices) -> np.ndarray:
+      return make_image_contact_sheet([tile_by_index[int(index)] for index in indices])
+
+    refined_tiles = []
+    refined_poses = diagnostics.get("poses_after_coarse_refiner")
+    if refined_poses is not None:
+      refined_poses = np.asarray(refined_poses, dtype=np.float32).reshape(-1, 4, 4)
+      refined_masks = self._render_pose_masks(K, color.shape[:2], refined_poses)
+      selected_positions = set(int(value) for value in diagnostics.get("coarse_selected_positions", []))
+      coarse_scores = np.asarray(diagnostics.get("coarse_scores", []), dtype=np.float32).reshape(-1)
+      score_by_position = {
+          position: float(coarse_scores[score_index])
+          for score_index, position in enumerate(diagnostics.get("coarse_selected_positions", []))
+          if score_index < len(coarse_scores)
+      }
+      for position, (centered_pose, rendered_mask) in enumerate(zip(refined_poses, refined_masks)):
+        original_index = int(kept_indices[position])
+        output_pose = centered_pose @ tf_to_centered_mesh
+        center_pose = output_pose @ np.linalg.inv(self.to_origin)
+        vis = np.ascontiguousarray(color, dtype=np.uint8).copy()
+        vis[target] = (0.65 * vis[target] + 0.35 * np.array([255, 0, 0])).astype(np.uint8)
+        rendered = rendered_mask > 0
+        intersection = int(np.logical_and(rendered, target).sum())
+        union = int(np.logical_or(rendered, target).sum())
+        rendered_iou = float(intersection / union) if union > 0 else 0.0
+        selected = position in selected_positions
+        status_color = (0, 255, 0) if selected else (255, 255, 0)
+        contours, _ = cv2.findContours(rendered_mask * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+          cv2.drawContours(vis, contours, -1, color=status_color, thickness=self.contour_thickness, lineType=cv2.LINE_AA)
+        vis = draw_xyz_axis(
+            vis,
+            ob_in_cam=center_pose,
+            scale=self.axis_scale,
+            K=K,
+            thickness=3,
+            transparency=0,
+            is_input_rgb=True,
+        )
+        score = score_by_position.get(position)
+        lines = [
+            f"axis_rank={rank_by_index[original_index]} after coarse Refiner",
+            f"mask_iou={rendered_iou:.3f} {'TO_SCORER' if selected else 'GEOMETRY_DROP'}",
+            f"coarse_score={'N/A' if score is None else f'{score:.4f}'}",
+        ]
+        for line_number, text in enumerate(lines):
+          y = 28 + line_number * 26
+          cv2.putText(vis, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 0, 0), 4, cv2.LINE_AA)
+          cv2.putText(vis, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.60, status_color, 1, cv2.LINE_AA)
+        cv2.rectangle(vis, (1, 1), (vis.shape[1] - 2, vis.shape[0] - 2), status_color, 4)
+        refined_tiles.append(vis)
+
+    self._axis_prior_visualization_count += 1
+    record_dir = os.path.join(
+        self.axis_prior_visualization_dir,
+      self._axis_prior_visualization_run_id,
+        f"register_{self._axis_prior_visualization_count:04d}",
+    )
+    os.makedirs(record_dir, exist_ok=True)
+    images = {
+        "input_rgb.jpg": color,
+        "candidates_before.jpg": make_contact_sheet(top_indices),
+        "candidates_boundary.jpg": make_contact_sheet(boundary_indices),
+        "candidates_kept.jpg": make_contact_sheet(kept_ranked),
+        "candidates_kept_after_refiner.jpg": make_image_contact_sheet(refined_tiles),
+    }
+    for filename, image in images.items():
+      path = os.path.join(record_dir, filename)
+      if not cv2.imwrite(path, np.ascontiguousarray(image[..., ::-1])):
+        raise RuntimeError(f"cv2.imwrite failed: {path}")
+
+    summary = {
+        "candidates_before": int(len(poses)),
+        "candidates_after": int(kept_count),
+        "max_angle_deg": float(diagnostics["threshold_deg"]),
+        "visualized_top_n": int(len(top_indices)),
+        "boundary_rank_start": int(boundary_start + 1),
+        "boundary_rank_end": int(boundary_end),
+        "candidates": [
+            {
+                "candidate_index": int(index),
+                "rank": int(rank_by_index[int(index)]),
+                "angle_deg": float(diagnostics["angles_deg"][index]),
+                "alignment": float(diagnostics["alignment"][index]),
+                "angle_passed": bool(diagnostics["angle_pass_mask"][index]),
+                "kept": int(index) in kept_set,
+                "rendered_mask_iou": iou_by_index.get(int(index)),
+            }
+            for index in ranked
+        ],
+    }
+    with open(os.path.join(record_dir, "summary.json"), "w", encoding="utf-8") as file:
+      json.dump(summary, file, indent=2, ensure_ascii=False)
+    print(f"[AxisPriorDebug] Saved candidate visualization: {record_dir}")
+
   def mask_iou(self, K: np.ndarray, image_shape: tuple[int, int], target_mask: np.ndarray) -> float:
     if not self.initialized:
       return 0.0
@@ -248,7 +494,13 @@ class FoundationPoseRealtimeTracker:
     union = np.logical_or(rendered_mask > 0, target > 0).sum()
     return float(intersection / union) if union > 0 else 0.0
 
-  def draw_visualization(self, color: np.ndarray, K: np.ndarray, pose: np.ndarray | None = None) -> np.ndarray:
+  def draw_visualization(
+      self,
+      color: np.ndarray,
+      K: np.ndarray,
+      pose: np.ndarray | None = None,
+      centered_pose: np.ndarray | None = None,
+  ) -> np.ndarray:
     color = np.ascontiguousarray(color, dtype=np.uint8)
     K = np.ascontiguousarray(K, dtype=np.float32)
     if pose is None:
@@ -261,7 +513,7 @@ class FoundationPoseRealtimeTracker:
     if self.vis_mode in ("box", "both"):
       vis = draw_posed_3d_box(K, img=vis, ob_in_cam=center_pose, bbox=self.bbox)
     if self.vis_mode in ("contour", "both"):
-      contour_mask = self.render_pose_mask(K, color.shape[:2]) * 255
+      contour_mask = self.render_pose_mask(K, color.shape[:2], pose=centered_pose) * 255
       contours, _ = cv2.findContours(contour_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
       if contours:
         cv2.drawContours(vis, contours, -1, color=(255, 255, 0), thickness=self.contour_thickness, lineType=cv2.LINE_AA)

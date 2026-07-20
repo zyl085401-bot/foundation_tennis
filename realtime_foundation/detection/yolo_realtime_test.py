@@ -71,6 +71,7 @@ camera = RealSenseReader(
     depth_min=float(camera_cfg.get("depth_min", 0.001)),
     depth_max=float(camera_cfg.get("depth_max", 3.0)),
     align_to_color=bool(camera_cfg.get("align_to_color", True)),
+    reset_before_start=bool(camera_cfg.get("reset_before_start", True)),
     verbose=True,
 )
 

@@ -232,11 +232,129 @@ class FoundationPose:
     return score.argsort()[:top_k]
 
 
-  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, init_strategy='default', coarse_refine_iter=1, coarse_score_filter='none', coarse_score_top_k=999999, fine_refine_iter=2, fine_top_k=16):
+  def estimate_axis_prior_from_depth_pca(self, xyz_map, mask, min_points=500, min_confidence=1.4, max_points=3000):
+    valid = (mask>0) & (xyz_map[...,2]>=0.001) & np.isfinite(xyz_map).all(axis=-1)
+    points = xyz_map[valid]
+    if len(points)<min_points:
+      return None, {
+        'axis_prior_status': 'too_few_points',
+        'axis_prior_points': int(len(points)),
+        'axis_prior_confidence': 0.0,
+      }
+
+    if len(points)>max_points:
+      ids = np.linspace(0, len(points)-1, max_points).astype(np.int64)
+      points = points[ids]
+
+    points = points.astype(np.float32)
+    centered = points - points.mean(axis=0, keepdims=True)
+    cov = centered.T @ centered / max(len(centered)-1, 1)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:,order]
+    confidence = float(eigvals[0] / max(eigvals[1], 1e-8))
+    if not np.isfinite(confidence) or confidence<min_confidence:
+      return None, {
+        'axis_prior_status': 'low_confidence',
+        'axis_prior_points': int(len(points)),
+        'axis_prior_confidence': confidence,
+        'axis_prior_eigenvalues': [float(v) for v in eigvals],
+      }
+
+    axis = eigvecs[:,0].astype(np.float32)
+    norm = np.linalg.norm(axis)
+    if norm<1e-8:
+      return None, {
+        'axis_prior_status': 'degenerate_axis',
+        'axis_prior_points': int(len(points)),
+        'axis_prior_confidence': confidence,
+        'axis_prior_eigenvalues': [float(v) for v in eigvals],
+      }
+    axis = axis / norm
+    return axis, {
+      'axis_prior_status': 'used',
+      'axis_prior_points': int(len(points)),
+      'axis_prior_confidence': confidence,
+      'axis_prior_eigenvalues': [float(v) for v in eigvals],
+      'axis_prior_scene_axis': [float(v) for v in axis],
+    }
+
+
+  def filter_pose_candidates_by_axis_prior(self, poses, scene_axis, model_axis=(0,0,1), max_angle_deg=45, min_candidates=12, max_candidates=0, collect_diagnostics=False):
+    if scene_axis is None or len(poses)==0:
+      return poses, {
+        'axis_prior_candidates_before': int(len(poses)),
+        'axis_prior_candidates_after': int(len(poses)),
+      }
+
+    model_axis = np.asarray(model_axis, dtype=np.float32).reshape(3)
+    model_norm = np.linalg.norm(model_axis)
+    if model_norm<1e-8:
+      return poses, {
+        'axis_prior_status': 'invalid_model_axis',
+        'axis_prior_candidates_before': int(len(poses)),
+        'axis_prior_candidates_after': int(len(poses)),
+      }
+    model_axis = model_axis / model_norm
+
+    scene_axis = np.asarray(scene_axis, dtype=np.float32).reshape(3)
+    scene_norm = np.linalg.norm(scene_axis)
+    if scene_norm<1e-8:
+      return poses, {
+        'axis_prior_status': 'invalid_scene_axis',
+        'axis_prior_candidates_before': int(len(poses)),
+        'axis_prior_candidates_after': int(len(poses)),
+      }
+    scene_axis = scene_axis / scene_norm
+
+    model_axis_t = torch.as_tensor(model_axis, device=poses.device, dtype=poses.dtype)
+    scene_axis_t = torch.as_tensor(scene_axis, device=poses.device, dtype=poses.dtype)
+    candidate_axes = torch.matmul(poses[:,:3,:3], model_axis_t)
+    candidate_axes = F.normalize(candidate_axes, dim=-1)
+    alignment = torch.abs((candidate_axes * scene_axis_t.reshape(1,3)).sum(dim=-1))
+    threshold = math.cos(math.radians(float(max_angle_deg)))
+    keep = torch.where(alignment>=threshold)[0]
+    min_candidates = max(1, min(int(min_candidates), len(poses)))
+    if len(keep)<min_candidates:
+      keep = alignment.argsort(descending=True)[:min_candidates]
+    max_candidates = int(max_candidates)
+    if max_candidates>0 and len(keep)>max_candidates:
+      max_candidates = max(min_candidates, min(max_candidates, len(poses)))
+      keep = keep[alignment[keep].argsort(descending=True)[:max_candidates]]
+    if collect_diagnostics:
+      ranked_indices = alignment.argsort(descending=True)
+      kept_mask = torch.zeros(len(poses), device=poses.device, dtype=torch.bool)
+      kept_mask[keep] = True
+      angles_deg = torch.rad2deg(torch.acos(alignment.clamp(0, 1)))
+      self.last_axis_prior_diagnostics = {
+          'poses_before': poses.detach().cpu().numpy().astype(np.float32),
+          'alignment': alignment.detach().cpu().numpy().astype(np.float32),
+          'angles_deg': angles_deg.detach().cpu().numpy().astype(np.float32),
+          'ranked_indices': ranked_indices.detach().cpu().numpy().astype(np.int64),
+          'kept_indices': keep.detach().cpu().numpy().astype(np.int64),
+          'kept_mask': kept_mask.detach().cpu().numpy(),
+          'angle_pass_mask': (alignment>=threshold).detach().cpu().numpy(),
+          'threshold_deg': float(max_angle_deg),
+      }
+    poses_filtered = poses[keep]
+    return poses_filtered, {
+      'axis_prior_candidates_before': int(len(poses)),
+      'axis_prior_candidates_after': int(len(poses_filtered)),
+      'axis_prior_max_candidates': int(max_candidates),
+      'axis_prior_max_alignment': float(alignment.max().detach().cpu()),
+      'axis_prior_min_kept_alignment': float(alignment[keep].min().detach().cpu()),
+      'axis_prior_max_angle_deg': float(max_angle_deg),
+      'axis_prior_model_axis': [float(v) for v in model_axis],
+    }
+
+
+  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, init_strategy='default', coarse_refine_iter=1, coarse_score_filter='none', coarse_score_top_k=999999, fine_refine_iter=2, fine_top_k=16, axis_prior_filter='none', axis_prior_model_axis=(0,0,1), axis_prior_max_angle_deg=45, axis_prior_min_candidates=12, axis_prior_max_candidates=0, axis_prior_min_points=500, axis_prior_min_confidence=1.4, axis_prior_debug=False):
     '''Copmute pose from given pts to self.pcd
     @pts: (N,3) np array, downsampled scene points
     '''
     timing = {}
+    self.last_axis_prior_diagnostics = None
     t_register_start = time.perf_counter()
     set_seed(0)
     logging.info('Welcome')
@@ -300,10 +418,45 @@ class FoundationPose:
     timing['pose_hypothesis'] = time.perf_counter() - t0
 
     xyz_map = depth2xyzmap(depth, K)
+    timing['axis_prior_filter'] = axis_prior_filter
+    timing['axis_prior_model_axis'] = [float(v) for v in axis_prior_model_axis]
+    timing['axis_prior_max_angle_deg'] = float(axis_prior_max_angle_deg)
+    timing['axis_prior_min_candidates'] = int(axis_prior_min_candidates)
+    timing['axis_prior_max_candidates_config'] = int(axis_prior_max_candidates)
+    timing['axis_prior_min_confidence'] = float(axis_prior_min_confidence)
+    timing['axis_prior_candidates_before'] = int(len(poses))
+    timing['axis_prior_candidates_after'] = int(len(poses))
+    if axis_prior_filter == 'depth_pca':
+      t0 = time.perf_counter()
+      scene_axis, axis_info = self.estimate_axis_prior_from_depth_pca(
+          xyz_map=xyz_map,
+          mask=ob_mask,
+          min_points=axis_prior_min_points,
+          min_confidence=axis_prior_min_confidence,
+      )
+      poses, filter_info = self.filter_pose_candidates_by_axis_prior(
+          poses=poses,
+          scene_axis=scene_axis,
+          model_axis=axis_prior_model_axis,
+          max_angle_deg=axis_prior_max_angle_deg,
+          min_candidates=axis_prior_min_candidates,
+          max_candidates=axis_prior_max_candidates,
+          collect_diagnostics=axis_prior_debug,
+      )
+      torch.cuda.synchronize()
+      timing['axis_prior'] = time.perf_counter() - t0
+      timing.update(axis_info)
+      timing.update(filter_info)
+      timing['pose_hypothesis_candidates_after_axis_prior'] = len(poses)
+    else:
+      timing['axis_prior_status'] = 'disabled'
     if init_strategy == 'topk_two_stage':
+      timing['refiner_coarse_candidates'] = int(len(poses))
       t0 = time.perf_counter()
       poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=coarse_refine_iter, get_vis=False)
       torch.cuda.synchronize()
+      if self.last_axis_prior_diagnostics is not None:
+        self.last_axis_prior_diagnostics['poses_after_coarse_refiner'] = poses.detach().cpu().numpy().astype(np.float32)
       timing['refiner_coarse'] = time.perf_counter() - t0
       timing['refiner_coarse_detail'] = dict(getattr(self.refiner, 'last_timing', {}))
 
@@ -314,14 +467,20 @@ class FoundationPose:
       else:
         score_ids = torch.linspace(0, len(poses) - 1, steps=score_k, device=poses.device).long()
       score_poses = poses[score_ids]
+      if self.last_axis_prior_diagnostics is not None:
+        self.last_axis_prior_diagnostics['coarse_selected_positions'] = score_ids.detach().cpu().numpy().astype(np.int64)
       torch.cuda.synchronize()
       timing['coarse_score_select'] = time.perf_counter() - t0
       timing['coarse_score_candidates'] = score_k
+      timing['scorer_coarse_candidates'] = int(len(score_poses))
       timing['coarse_score_filter'] = coarse_score_filter
 
       t0 = time.perf_counter()
       scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=score_poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=False)
       torch.cuda.synchronize()
+      if self.last_axis_prior_diagnostics is not None:
+        coarse_scores = scores.detach().cpu().numpy() if torch.is_tensor(scores) else np.asarray(scores)
+        self.last_axis_prior_diagnostics['coarse_scores'] = np.asarray(coarse_scores, dtype=np.float32).reshape(-1)
       timing['scorer_coarse'] = time.perf_counter() - t0
 
       t0 = time.perf_counter()
@@ -332,6 +491,7 @@ class FoundationPose:
       torch.cuda.synchronize()
       timing['topk_select'] = time.perf_counter() - t0
 
+      timing['refiner_fine_candidates'] = int(len(poses))
       t0 = time.perf_counter()
       poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=fine_refine_iter, get_vis=self.debug>=2)
       torch.cuda.synchronize()
@@ -340,6 +500,7 @@ class FoundationPose:
       if vis is not None:
         imageio.imwrite(f'{self.debug_dir}/vis_refiner.png', vis)
 
+      timing['scorer_fine_candidates'] = int(len(poses))
       t0 = time.perf_counter()
       scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2)
       torch.cuda.synchronize()
@@ -355,6 +516,7 @@ class FoundationPose:
           for key in detail_keys
       }
     else:
+      timing['refiner_candidates'] = int(len(poses))
       t0 = time.perf_counter()
       poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=iteration, get_vis=self.debug>=2)
       torch.cuda.synchronize()
@@ -363,6 +525,7 @@ class FoundationPose:
       if vis is not None:
         imageio.imwrite(f'{self.debug_dir}/vis_refiner.png', vis)
 
+      timing['scorer_candidates'] = int(len(poses))
       t0 = time.perf_counter()
       scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2)
       torch.cuda.synchronize()
@@ -392,7 +555,7 @@ class FoundationPose:
 
     torch.cuda.synchronize()
     timing['register'] = time.perf_counter() - t_register_start
-    known_time = sum(timing.get(key, 0.0) for key in ('depth_preprocess', 'pose_hypothesis', 'refiner', 'coarse_score_select', 'scorer', 'topk_select', 'sort_select'))
+    known_time = sum(timing.get(key, 0.0) for key in ('depth_preprocess', 'pose_hypothesis', 'axis_prior', 'refiner', 'coarse_score_select', 'scorer', 'topk_select', 'sort_select'))
     timing['other'] = max(timing['register'] - known_time, 0.0)
     self.last_register_timing = timing
 

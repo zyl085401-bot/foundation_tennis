@@ -5,4 +5,5 @@ serial: null
 depth_min: 0.001
 depth_max: 3.0
 align_to_color: true
+reset_before_start: true
 log_interval: 1.0

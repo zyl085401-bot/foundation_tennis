@@ -1,10 +1,11 @@
 camera:
   width: 640
   height: 480
-  fps: 60
+  fps: 30
   serial: null
   depth_min: 0.001
   depth_max: 3.0
+  reset_before_start: true
 
 yolo:
   weights: realtime_foundation/yolo_weights/best.pt
@@ -17,28 +18,53 @@ yolo:
   min_mask_area: 100
   morph_kernel: 5
 
+recording:
+  enabled: true
+  output_dir: realtime_foundation/outputs/frame_records
+  reset_on_start: true  # 每次启动清空旧记录，避免同名 frame 文件混在一起。
+  save_register: true
+  save_track: true
+  require_same_frame_mask: true # tracking 只记录与 RGB-D 同 frame_id 的 mask；调试准确性优先。
+  save_topk_poses: true
+  topk_pose_count: 5
+  jpeg_quality: 90
+
 foundationpose:
   mesh_file: FoundationPose/demo_data/cup0708/mesh/textured_simple.obj
-  debug_dir: realtime_foundation/outputs/debug
-  debug: 1
+  debug_dir: realtime_foundation/outputs/frame_records
+  debug: 0
   use_float32_crop_window_patch: true
 
-  init_min_n_views: 30  # 40
-  init_inplane_step: 60 # 60
+  init_min_n_views: 16  # 40 30  16 在物体周围的球面上，采样多少个观察方向。
+  init_inplane_step: 120 # 60 60 90每个观察方向，再绕视线方向旋转一圈，每隔多少度采样一次。
 
   est_refine_iter: 3
-
   init_strategy: topk_two_stage    # topk_two_stage
-  
   coarse_refine_iter: 1
-
   coarse_score_filter: geometry
-  coarse_score_top_k: 48
-  
+  coarse_score_top_k: 6
   fine_refine_iter: 2
-  fine_top_k: 16
+  fine_top_k: 16 # 决定保留几个
+
+  axis_prior_enabled: true
+  axis_prior_filter: depth_pca
+  axis_prior_model_axis: [0.0, 1.0, 0.0]
+  axis_prior_max_angle_deg: 60
+  axis_prior_min_candidates: 12
+  axis_prior_max_candidates: 12
+  axis_prior_min_points: 500
+  axis_prior_min_confidence: 1.0
+
+  # 轴先验候选诊断：开启后保存过滤前、截断边界和最终保留候选的联系图。
+  # 仅用于初始化调参，会增加额外渲染和图片写入耗时；不会在 tracking 阶段执行。
+  # axis_prior_visualization_enabled: false
+  # axis_prior_visualization_dir: realtime_foundation/outputs/axis_prior_debug
+  # axis_prior_visualization_top_n: 24
+  # axis_prior_visualization_boundary_margin: 6
+  # axis_prior_visualization_max_records: 20
 
   track_refine_iter: 2
+
   vis_mode: contour  # box or contour
   contour_thickness: 3
   axis_scale: 0.1
@@ -48,6 +74,7 @@ runtime:
   success_timing_only: true # true: 只在初始化成功后打印阶段耗时统计，屏蔽等待/拒绝等普通日志。
   timing_summary_format: table
   detection_interval: 5    # 开始 tracking 后，每隔多少帧运行一次 YOLO 检查目标是否还在。
+  yolo_worker_frame_stride: 1 # YOLO 线程每隔多少帧处理一次；init_only 建议 1，realtime 可设成 detection_interval 降低 GPU 竞争。
   # relocalize_iou: 0.25
   min_valid_depth_pixels: 500
   max_missing_detections: 2 # YOLO 连续多少次检查不到目标，才认为目标真的消失
@@ -63,14 +90,12 @@ runtime:
   register_required_stable_detections: 2
   register_max_area_change: 0.35
   register_border_margin: 40
-  register_min_render_iou: 0.82
-  register_max_translation_drift: 0.0  #这功能没用上，等搞完了一起决定要不要删掉
+  register_min_render_iou: 0.89
+  register_uncertain_score_gap: 0.01
+  register_uncertain_render_iou: 0.86
+  register_max_translation_drift: 0.0 #这功能没用上，等搞完了一起决定要不要删掉
   
   show_window: true
-  save_init_vis: true
-  save_init_vis_dir: realtime_foundation/outputs/debug/init_vis
-  save_init_diagnostics: true
-  save_init_diagnostics_dir: realtime_foundation/outputs/debug/init_diagnostics
   pose_output: realtime_foundation/outputs/latest_pose.txt
   loop_sleep: 0.0
 

@@ -21,6 +21,7 @@ class RealSenseReader:
       depth_min: float = 0.001,
       depth_max: float = 3.0,
       align_to_color: bool = True,
+      reset_before_start: bool = True,
       verbose: bool = False,
   ):
     try:
@@ -38,20 +39,31 @@ class RealSenseReader:
     self.depth_min = depth_min
     self.depth_max = depth_max
     self.align_to_color = align_to_color
+    self.reset_before_start = reset_before_start
     self.verbose = verbose
-    self.pipeline = rs.pipeline()
-    self.config = rs.config()
-    if serial:
-      self.config.enable_device(serial)
-    self.config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
-    self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-    self.align = rs.align(rs.stream.color) if align_to_color else None
+    self.pipeline = None
+    self.config = None
+    self.align = None
     self.profile = None
     self.depth_scale = None
     self.K = None
     self.last_frame_error_log_time = 0.0
+    self._create_pipeline_objects()
+
+  def _create_pipeline_objects(self) -> None:
+    self.pipeline = self.rs.pipeline()
+    self.config = self.rs.config()
+    if self.serial:
+      self.config.enable_device(self.serial)
+    self.config.enable_stream(self.rs.stream.depth, self.width, self.height, self.rs.format.z16, self.fps)
+    self.config.enable_stream(self.rs.stream.color, self.width, self.height, self.rs.format.bgr8, self.fps)
+    self.align = self.rs.align(self.rs.stream.color) if self.align_to_color else None
 
   def start(self) -> None:
+    if self.reset_before_start:
+      self.stop()
+      self._create_pipeline_objects()
+
     devices = self.query_devices()
     self._log_requested_config(devices)
     if not devices:
@@ -76,13 +88,15 @@ class RealSenseReader:
     self._log_started_config(color_stream)
 
   def stop(self) -> None:
-    if self.profile is not None:
+    if self.profile is not None and self.pipeline is not None:
       try:
         self.pipeline.stop()
       except RuntimeError as exc:
         print(f"[RealSense] Failed to stop pipeline cleanly: {exc}")
       finally:
         self.profile = None
+        self.depth_scale = None
+        self.K = None
 
   def get_frame(self) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     try:
@@ -137,6 +151,7 @@ class RealSenseReader:
     print(f"  depth: {self.width}x{self.height}@{self.fps} z16")
     print(f"  depth range: {self.depth_min:.3f} m - {self.depth_max:.3f} m")
     print(f"  align depth to color: {self.align_to_color}")
+    print(f"  reset before start: {self.reset_before_start}")
     print(f"  serial filter: {self.serial if self.serial else 'none'}")
     print(f"[RealSense] Devices found: {len(devices)}")
     for index, device in enumerate(devices):
@@ -195,6 +210,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--depth-min", type=float, default=None, help="Override minimum valid depth in meters from YAML.")
   parser.add_argument("--depth-max", type=float, default=None, help="Override maximum valid depth in meters from YAML.")
   parser.add_argument("--no-align", action="store_true", help="Disable depth-to-color alignment for debugging only.")
+  parser.add_argument("--no-reset-before-start", action="store_true", help="Do not stop and recreate the RealSense pipeline before starting.")
   parser.add_argument("--log-interval", type=float, default=None, help="Override seconds between frame debug prints from YAML.")
   return parser.parse_args()
 
@@ -224,6 +240,7 @@ def build_runtime_config(args: argparse.Namespace) -> dict:
       "depth_min": float(config.get("depth_min", 0.001)),
       "depth_max": float(config.get("depth_max", 3.0)),
       "align_to_color": bool(config.get("align_to_color", True)),
+      "reset_before_start": bool(config.get("reset_before_start", True)),
       "log_interval": float(config.get("log_interval", 1.0)),
   }
 
@@ -233,6 +250,8 @@ def build_runtime_config(args: argparse.Namespace) -> dict:
       runtime_config[key] = value
   if args.no_align:
     runtime_config["align_to_color"] = False
+  if args.no_reset_before_start:
+    runtime_config["reset_before_start"] = False
   runtime_config["config_path"] = os.path.abspath(args.config)
   return runtime_config
 
@@ -259,6 +278,7 @@ def run_preview(args: argparse.Namespace) -> None:
       depth_min=config["depth_min"],
       depth_max=config["depth_max"],
       align_to_color=config["align_to_color"],
+      reset_before_start=config["reset_before_start"],
       verbose=True,
   ) as reader:
     print("Press q or ESC to exit")
