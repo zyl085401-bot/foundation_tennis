@@ -1,59 +1,300 @@
 camera:
+  source: ros2   # realsense
   width: 640
   height: 480
   fps: 30
   serial: null
   depth_min: 0.001
   depth_max: 3.0
+  align_to_color: true
   reset_before_start: true
 
+  ros2:
+    camera_namespace: ""
+    camera_name: camera
+    color_topic: /camera/color/image_raw
+    depth_topic: /camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/color/camera_info
+    enable_color: true
+    enable_depth: true
+    align_depth: true
+    enable_sync: true
+    initial_reset: false
+    publish_tf: false  # FoundationPose直接使用固定外参做数值转换，不依赖RealSense TF。
+    # 曝光控制：优先使用 *_exposure_ms（毫秒）；*_exposure 保留为兼容旧配置的微秒值。
+    # 设定手动 exposure 或 gain 时，启动器会自动关闭对应流的自动曝光。
+    # 两种曝光单位不能同时设置；曝光/增益有效范围因相机型号而异。
+    color_auto_exposure: true
+    color_exposure: null
+    color_exposure_ms: null
+    color_gain: null
+    depth_auto_exposure: null
+    depth_exposure: null
+    depth_exposure_ms: null
+    depth_gain: null
+    # RealSense驱动没有逐话题关闭开关；将未使用发布器重映射到隐藏命名空间。
+    # 保留color/image_raw、aligned_depth_to_color/image_raw和color/camera_info。
+    suppress_unused_topics: true
+    depth_scale: 0.001
+    sync_queue_size: 10
+    sync_slop_sec: 0.03
+    frame_timeout_sec: 5.0
+    bridge_cpu_cores: [0, 1] #0 1 2
+    model_cpu_cores: [2, 3] # 3 4 5 6 7
+    shared_slot_count: 3
+    startup_timeout_sec: 10.0
+    reader_node_name: foundationpose_rgbd_reader
+
+# FoundationPose 姿态的 ROS2 标准消息输出。PoseStamped 表示物体坐标系在彩色相机
+# optical frame 下的位姿；状态只在发生变化时发布，并为后启动的订阅者保留最新值。
+pose_ros2:
+  enabled: true
+  node_name: foundationpose_pose_publisher
+  pose_topic: /foundationpose/object_pose
+  status_topic: /foundationpose/status
+  frame_id: camera_color_optical_frame
+  child_frame_id: detected_object
+  publish_status: true
+  publish_tf: false
+  qos:
+    reliability: reliable
+    depth: 1
+  # RViz2调试画面；发布内容与realtime窗口使用同一张RGB图像。
+  # enabled=false时不创建图像Publisher，也不会为该功能生成叠加图。
+  visualization:
+    enabled: true
+    topic: /foundationpose/visualization
+    frame_id: camera_color_optical_frame
+    publish_rate_hz: 0.0  # 0：不限制，跟随原窗口的更新节奏；正数：限制最大发布频率。
+    only_with_subscribers: true  # RViz2未订阅时跳过叠加图生成和消息构造。
+    qos:
+      reliability: best_effort
+      depth: 1
+  # 控制端目标流：直接计算 base_from_camera @ camera_pose 并发布base_Link下的结果。
+  # 固定外参对应上方相机的camera_color_optical_frame；不修改URDF，也不发布相机TF。
+  # 每次成功Register更新目标；后台以固定频率重复最新结果，超时后暂停而不发送旧值。
+  wheelarm_target:
+    enabled: true
+    topic: /wheelarm/target
+    base_pose_topic: /foundationpose/object_pose_base
+    source_frame: camera_color_optical_frame
+    target_frame: base_Link
+    publish_static_tf: false
+    publish_rate_hz: 20.0
+    stale_timeout_sec: 1.0
+    base_from_camera:
+      - [0.0, -0.6427661390, 0.766062459, 0.22117]
+      - [-1.0, 0.0, 0.0, 0.0175]
+      - [0.0, -0.7660624590, -0.6427661390, 0.18592]
+      - [0.0, 0.0, 0.0, 1.0]
+
+#      - [0.0, -0.766062459, -0.642766139, 0.22117]
+#      - [-1.0, 0.0, 0.0, 0.0175]
+#      - [0.0, 0.642766139, -0.766062459, 0.18592]
+#      - [0.0, 0.0, 0.0, 1.0]
+
 yolo:
-  weights: realtime_foundation/yolo_weights/best.pt
+  precision: int8             # int8|fp16；当前使用 tennis INT8 engine。
+  io_precision: int8          # int8|fp32；INT8输入启用GPU整数预处理，失败时回退FP32输入INT8网络。
+  int8_io_weights: realtime_foundation/yolo_weights/tennis1_best_480x640_int8_io_trt104.engine
+  int8_weights: realtime_foundation/yolo_weights/tennis1_best_480x640_int8_trt104.engine
+  weights: realtime_foundation/yolo_weights/tennis1_best_480x640_trt104.engine
+  fallback_to_fp32_io: true
+  fallback_to_fp16: true
+  int8_input_dynamic_range: 1.0  # normalized RGB [0,1]；必须与INT8 I/O Engine构建参数一致。
+  postprocess_backend: gpu    # gpu|cpu；cpu 仅支持 execution_path: fast。
+
   target_class: null
   target_class_id: 0
-  conf: 0.75
-  imgsz: 640
+  conf: 0.85
+  imgsz: [480, 640]
   device: cuda:0
   half: true
   min_mask_area: 100
   morph_kernel: 5
+  gpu_best_mask_topk: 3  # GPU先按分数选top-k候选，再一次性回CPU做清理与最终择优。
+  execution_path: fast  # legacy|fast；完成逐帧一致性确认后再切换生产路径。
+  profile_stages: false   # 生产关闭；基准分阶段计时时开启。########################################################
+  fallback_to_legacy: false
 
 recording:
-  enabled: true
+  enabled: true #####################################################
   output_dir: realtime_foundation/outputs/frame_records
   reset_on_start: true  # 每次启动清空旧记录，避免同名 frame 文件混在一起。
   save_register: true
   save_track: true
   require_same_frame_mask: true # tracking 只记录与 RGB-D 同 frame_id 的 mask；调试准确性优先。
-  save_topk_poses: true
+  save_topk_poses: false
   topk_pose_count: 5
   jpeg_quality: 90
 
 foundationpose:
-  mesh_file: FoundationPose/demo_data/cup0708/mesh/textured_simple.obj
+  mesh_file: FoundationPose/demo_data/tennis/mesh/textured_simple_compatible.obj
   debug_dir: realtime_foundation/outputs/frame_records
   debug: 0
   use_float32_crop_window_patch: true
 
   init_min_n_views: 16  # 40 30  16 在物体周围的球面上，采样多少个观察方向。
-  init_inplane_step: 120 # 60 60 90每个观察方向，再绕视线方向旋转一圈，每隔多少度采样一次。
+  init_inplane_step: 90 # 120 60 90每个观察方向，再绕视线方向旋转一圈，每隔多少度采样一次。
 
-  est_refine_iter: 3
+  # Phase 3A：固定Phase 3-0中平移误差最小的Candidate 3（原始rot_grid索引30）。
+  initial_candidate_selection:
+    enabled: true
+    mode: explicit_indices
+    indices: [30]
+
+  # N=1仅运行一次Coarse Refiner；跳过Translation Consensus和Scorer。
+  # 最终Render IoU门仍保留，N=5 Recovery将在下一阶段接入。
+  single_candidate_mode:
+    enabled: true
+
+  # 保留Phase 2阈值供下一阶段N=5 Recovery使用；N=1 Fast Path不会调用Consensus。
+  translation_consensus:
+    enabled: true
+    shadow_only: false
+    median_distance_threshold_m: 0.004
+    inlier_distance_threshold_m: 0.006
+    min_inlier_count: 4
+    fallback: coarse_scorer
+
+  # Phase 3-0诊断已完成；N=1运行时关闭，避免无意义的自比较和JSONL写入。
+  candidate_predictability_shadow:
+    enabled: false
+    expected_candidate_count: 1
+    output_path: realtime_foundation/outputs/candidate_predictability/phase3_0.jsonl
+    reset_on_start: true
+    summary_interval: 25
+
+  est_refine_iter: 1
   init_strategy: topk_two_stage    # topk_two_stage
   coarse_refine_iter: 1
   coarse_score_filter: geometry
-  coarse_score_top_k: 6
-  fine_refine_iter: 2
-  fine_top_k: 16 # 决定保留几个
+  coarse_score_top_k: 1
+  fine_stage_enabled: false  # false：跳过 Fine Refiner 和 Fine Scorer，直接使用 Coarse Scorer 结果。
+  fine_refine_iter: 1        # 仅在 fine_stage_enabled=true 时生效。
+  fine_top_k: 1 # 决定保留几个
+  # 当Coarse Scorer不会删除任何候选时跳过该阶段；仅改变候选顺序，人工A/B确认前保持关闭。
+  skip_redundant_coarse_scorer: true
 
-  axis_prior_enabled: true
+  # 球体深度PCA主轴不稳定；候选数量改由initial_candidate_selection独立控制。
+  axis_prior_enabled: false
   axis_prior_filter: depth_pca
   axis_prior_model_axis: [0.0, 1.0, 0.0]
   axis_prior_max_angle_deg: 60
-  axis_prior_min_candidates: 12
-  axis_prior_max_candidates: 12
+  axis_prior_min_candidates: 5
+  axis_prior_max_candidates: 8
   axis_prior_min_points: 500
   axis_prior_min_confidence: 1.0
+
+  # 仅用于TensorRT转换前采集真实A/B与PyTorch参考输出；采集会同步GPU到CPU并增加耗时。
+  network_input_capture:
+    enabled: false
+    output_dir: realtime_foundation/outputs/network_input_capture
+    max_samples_per_signature: 200
+
+  # Final Scorer蒸馏候选组采集。默认关闭；开启后只旁路写数据，最终Pose仍由Legacy Scorer决定。
+  # 共享Feature通过额外PyTorch Encoder前向提取，不替换当前Refiner TensorRT输出。
+  distillation_capture:
+    enabled: false
+    output_dir: realtime_foundation/outputs/distillation_capture
+    expected_candidate_count: 5
+    max_groups: 200
+    stride: 1
+    strict: false
+    feature_version: refinenet_ab_mean_v1
+    sequence_id: null
+
+  # 生产路径关闭每次TensorRT调用后的CPU级全GPU同步；Refiner/Scorer函数边界仍保留同步。
+  network_internal_sync_enabled: false
+
+  # 每帧只扫描一次Mask/Depth，并由中心估计、Depth PCA和Geometry候选筛选共享统计结果。
+  frame_statistics_reuse_enabled: true
+
+  # 注册质量门已生成最终Pose的Render Mask；轮廓显示/记录直接复用，避免相同Pose再次渲染。
+  quality_render_mask_reuse_enabled: true
+
+  # 网络渲染LOD总开关。关闭时所有阶段继续使用原Mesh；开启失败时自动回退原Mesh。
+  # 原Mesh始终用于中心/直径/点云/BBox/Pose坐标系、注册质量门和最终轮廓显示。
+  render_lod:
+    enabled: true
+    mesh_file: FoundationPose/demo_data/tennis/mesh/textured_simple_0.0625.obj
+    stages:
+      refiner_coarse: true
+      scorer_coarse: true
+      refiner_fine: true
+      scorer_fine: true
+      refiner_track: false
+      refiner_default: true
+      scorer_default: true
+    validation:
+      require_texture: true
+      min_texture_size: 16
+      max_face_ratio: 0.75
+      max_center_delta_ratio: 0.01
+      max_extent_delta_ratio: 0.03
+    # 使用成功初始化时的真实RGB、K和最终Pose生成2x2对比图；调用位于init_total计时结束之后。
+    comparison:
+      enabled: false #####################################################################
+      output_dir: realtime_foundation/outputs/render_lod_comparison
+      max_records: 5
+      jpeg_quality: 95
+
+  # 仅用于拆分nvdiffrast渲染内部耗时；会增加CUDA Event和同步开销，正常运行保持关闭。
+  render_profile_enabled: false
+
+  # 实验性无损优化：将三处逐顶点广播矩阵乘法改为批量矩阵乘法；人工A/B确认前保持关闭。
+  render_batched_matmul_enabled: true
+
+  # 实验性Scorer优化：复用FoundationPose已有全图XYZ并直接Warp到Crop；人工A/B确认前保持关闭。
+  scorer_precomputed_xyz_enabled: true
+
+  # Refiner阶段一优化：复用GPU帧/Pose、TensorRT直用NCHW、CUDA Event计时及逆矩阵复用；人工A/B确认前保持关闭。
+  refiner_stage1_optimizations_enabled: true
+
+  # Warp阶段二实验：分别控制Refiner/Scorer共享采样Grid，以及Scorer在预计算XYZ路径跳过未使用的Depth Warp。
+  refiner_shared_warp_grid_enabled: true
+  scorer_shared_warp_grid_enabled: true
+  scorer_skip_unused_depth_warp_enabled: true
+
+  # Phase 1：仅Coarse Refiner降低到128；Fine、Track及全部Scorer继续使用训练分辨率160。
+  refiner_input_sizes:
+    refiner_coarse: [128, 128]
+    refiner_fine: [128, 128]
+    refiner_track: [160, 160]
+
+  # Phase 3A使用固定Batch=1、128x128 FP16 Coarse Refiner；Scorer仅为下一阶段Recovery保留。
+  # 可用FOUNDATIONPOSE_REFINER_TENSORRT和FOUNDATIONPOSE_SCORER_TENSORRT单独覆盖。
+  tensorrt:
+    refiner:
+      enabled: true
+      precision: fp16
+      fallback_to_fp16: false
+      int8_engine_paths:
+        refiner_coarse: realtime_foundation/engine/refiner_coarse_n5_12_128x128_int8_trt104.engine
+        refiner_fine: realtime_foundation/engine/refiner_fine_n5_12_128x128_int8_trt104.engine
+      engine_paths:
+        refiner_coarse: realtime_foundation/engine/refiner_coarse_n1_128x128_fp16_trt104.engine
+        refiner_fine: realtime_foundation/engine/refiner_n5_12_128x128_fp16_trt104.engine
+      # 精确候选数优先于上面的默认引擎；Recovery保持原Phase 2 N=5 INT8路径。
+      candidate_engine_paths:
+        refiner_coarse:
+          5:
+            - realtime_foundation/engine/refiner_coarse_n5_12_128x128_int8_trt104.engine
+            - realtime_foundation/engine/refiner_n5_12_128x128_fp16_trt104.engine
+      min_candidates: 1
+      max_candidates: 1
+      stages: [refiner_coarse]  # refiner_track固定使用PyTorch。
+    scorer:
+      enabled: true
+      precision: int8
+      fallback_to_fp16: false
+      # Scorer候选维参与Cross Attention，不能padding；N=5和N=6使用独立固定shape引擎。
+      int8_engine_paths:
+        5: realtime_foundation/engine/scorer_n5_int8_attn_fp32_trt104.engine
+        6: realtime_foundation/engine/scorer_n6_int8_attn_fp32_trt104.engine
+      engine_paths:
+        5: realtime_foundation/engine/scorer_n5_fp16_attn_fp32_trt104.engine
+        6: realtime_foundation/engine/scorer_n6_fp16_attn_fp32_trt104.engine
 
   # 轴先验候选诊断：开启后保存过滤前、截断边界和最终保留候选的联系图。
   # 仅用于初始化调参，会增加额外渲染和图片写入耗时；不会在 tracking 阶段执行。
@@ -70,7 +311,7 @@ foundationpose:
   axis_scale: 0.1
 
 runtime:
-  mode: init_only       # init_only: 每次只做 YOLO + FoundationPose register；realtime: 初始化后进入 tracking。
+  mode: init_only      # init_only: 每次只做 YOLO + FoundationPose register；realtime: 初始化后进入 tracking。
   success_timing_only: true # true: 只在初始化成功后打印阶段耗时统计，屏蔽等待/拒绝等普通日志。
   timing_summary_format: table
   detection_interval: 5    # 开始 tracking 后，每隔多少帧运行一次 YOLO 检查目标是否还在。
@@ -79,7 +320,7 @@ runtime:
   min_valid_depth_pixels: 500
   max_missing_detections: 2 # YOLO 连续多少次检查不到目标，才认为目标真的消失
   min_detection_conf: 0.7
-  min_detection_area: 14000
+  min_detection_area: 4000
   max_detection_area: 90000
   detection_roi_xyxy: null
   min_mask_median_depth: 0.15
@@ -87,18 +328,49 @@ runtime:
   status_log_interval: 30
   register_retry_interval: 30
 
-  register_required_stable_detections: 2
+  register_required_stable_detections: 1 # 有x帧稳定帧出现才进行foundationpose注册；避免初始帧噪声导致的误注册。
   register_max_area_change: 0.35
-  register_border_margin: 40
+  register_border_margin: 10
   register_min_render_iou: 0.89
+  register_quality_gpu_iou_enabled: true  # Render Mask和IoU保留在GPU，仅回传最终IoU标量。
   register_uncertain_score_gap: 0.01
   register_uncertain_render_iou: 0.86
   register_max_translation_drift: 0.0 #这功能没用上，等搞完了一起决定要不要删掉
+
+  # Phase 3B：N=1未通过最终Render IoU门时，在同一帧执行原Phase 2 N=5路径。
+  # 只需修改enabled即可控制是否回退；false时维持纯N=1并直接拒绝失败帧。
+  register_recovery:
+    enabled: false
+    trigger_reasons: [rendered_mask_iou_below_threshold]
+    profile:
+      initial_candidate_selection:
+        enabled: true
+        mode: so3_farthest
+        count: 5
+      single_candidate_mode:
+        enabled: false
+      translation_consensus:
+        enabled: true
+        shadow_only: false
+        median_distance_threshold_m: 0.004
+        inlier_distance_threshold_m: 0.006
+        min_inlier_count: 4
+        fallback: coarse_scorer
+      candidate_predictability_shadow:
+        enabled: false
+      coarse_score_filter: geometry
+      coarse_score_top_k: 5
+      fine_stage_enabled: false
+      fine_top_k: 5
   
-  show_window: true
+  show_window: false
+  pose_output_enabled: false
   pose_output: realtime_foundation/outputs/latest_pose.txt
   loop_sleep: 0.0
 
-
-#说真的有一个很大的问题，这些修改会不会影响到后面的追踪环节呢
+# 单帧 NPZ 回放候选流水线诊断。仅由 simulate_recorded_camera.py 读取；
+# 开启后保存各阶段联系图、固定候选 ID、Pose/更新量、筛选指标、JSON 和 NPZ。
+# 会增加 GPU 渲染、CPU 同步和磁盘写入耗时，实时生产路径不会读取此开关。
+simulation:
+  candidate_pipeline_debug_enabled: false
 

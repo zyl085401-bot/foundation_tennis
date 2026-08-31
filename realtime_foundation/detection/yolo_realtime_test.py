@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 import time
@@ -20,6 +21,16 @@ def resolve_project_path(path):
     if path is None or os.path.isabs(path):
         return path
     return os.path.join(PROJECT_ROOT, path)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Real-time YOLO segmentation preview using RealSense.")
+    parser.add_argument("--config", default=CONFIG, help="Base YAML configuration file.")
+    parser.add_argument("--weights", default=None, help="Override yolo.weights, for example tennis_best.pt.")
+    parser.add_argument("--execution-path", choices=("legacy", "fast"), default=None)
+    parser.add_argument("--conf", type=float, default=None, help="Override the detection confidence threshold.")
+    parser.add_argument("--target-class-id", type=int, default=None)
+    return parser.parse_args()
 
 
 class LatestFrameCamera:
@@ -57,11 +68,20 @@ class LatestFrameCamera:
                 self.latest_frame_id += 1
                 self.captured_frames += 1
 
-with open(CONFIG, "r", encoding="utf-8") as f:
+args = parse_args()
+config_path = resolve_project_path(args.config)
+with open(config_path, "r", encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
 
 camera_cfg = cfg["camera"]
 yolo_cfg = cfg["yolo"]
+weights = resolve_project_path(args.weights or yolo_cfg["weights"])
+execution_path = args.execution_path
+if execution_path is None:
+    execution_path = "legacy" if os.path.splitext(weights)[1].lower() == ".pt" else str(yolo_cfg.get("execution_path", "legacy"))
+
+print(f"[YOLO] weights={weights}")
+print(f"[YOLO] execution_path={execution_path}")
 
 camera = RealSenseReader(
     width=int(camera_cfg.get("width", 640)),
@@ -76,15 +96,19 @@ camera = RealSenseReader(
 )
 
 detector = YoloSegmenter(
-    weights=resolve_project_path(yolo_cfg["weights"]),
+    weights=weights,
     target_class=yolo_cfg.get("target_class"),
-    target_class_id=yolo_cfg.get("target_class_id"),
-    conf=float(yolo_cfg.get("conf", 0.35)),
-    imgsz=int(yolo_cfg.get("imgsz", 640)),
+    target_class_id=args.target_class_id if args.target_class_id is not None else yolo_cfg.get("target_class_id"),
+    conf=args.conf if args.conf is not None else float(yolo_cfg.get("conf", 0.35)),
+    imgsz=yolo_cfg.get("imgsz", 640),
     device=yolo_cfg.get("device"),
     half=bool(yolo_cfg.get("half", True)),
     min_mask_area=int(yolo_cfg.get("min_mask_area", 100)),
     morph_kernel=int(yolo_cfg.get("morph_kernel", 5)),
+    execution_path=execution_path,
+    profile_stages=bool(yolo_cfg.get("profile_stages", False)),
+    fallback_to_legacy=bool(yolo_cfg.get("fallback_to_legacy", True)),
+    postprocess_backend=str(yolo_cfg.get("postprocess_backend", "gpu")),
 )
 
 frame_index = 0

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+from pathlib import Path
+import platform
 import sys
 import time
 from dataclasses import dataclass
@@ -26,14 +29,53 @@ from estimater import (  # noqa: E402
     draw_posed_3d_box,
     draw_xyz_axis,
     nvdiffrast_render,
+    nvdiffrast_render_mask,
     set_logging_format,
     set_seed,
 )
 import learning.training.predict_pose_refine as pose_refine_module  # noqa: E402
 import learning.training.predict_score as score_module  # noqa: E402
+from .distillation_capture import DistillationCaptureWriter  # noqa: E402
+from .rotation_candidate_selector import select_explicit_candidates, select_so3_farthest_candidates  # noqa: E402
 
 
 _ORIGINAL_COMPUTE_CROP_WINDOW_TF_BATCH = pose_refine_module.compute_crop_window_tf_batch
+_RENDER_LOD_STAGE_NAMES = {
+  "refiner_coarse",
+  "scorer_coarse",
+  "refiner_fine",
+  "scorer_fine",
+  "refiner_track",
+  "refiner_default",
+  "scorer_default",
+}
+
+
+def _sha256_file(path: str | os.PathLike[str]) -> str:
+  digest = hashlib.sha256()
+  with open(path, "rb") as file:
+    for chunk in iter(lambda: file.read(1024 * 1024), b""):
+      digest.update(chunk)
+  return digest.hexdigest()
+
+
+def _artifact_metadata(path: str | os.PathLike[str] | None) -> dict | None:
+  if path is None:
+    return None
+  resolved = Path(path).expanduser().resolve()
+  if not resolved.is_file():
+    return {"path": str(resolved), "exists": False}
+  return {
+      "path": str(resolved),
+      "exists": True,
+      "size_bytes": resolved.stat().st_size,
+      "sha256": _sha256_file(resolved),
+  }
+
+
+def _sha256_json(value: object) -> str:
+  payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+  return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _compute_crop_window_tf_batch_float32(*, pts, H, W, poses, K, crop_ratio, out_size, method, mesh_diameter=None):
@@ -129,11 +171,16 @@ class FoundationPoseRealtimeTracker:
       use_float32_crop_window_patch: bool = True,
       init_min_n_views: int = 40,
       init_inplane_step: int = 60,
+      initial_candidate_selection: dict | None = None,
+      translation_consensus: dict | None = None,
+      candidate_predictability_shadow: dict | None = None,
+      single_candidate_mode: dict | None = None,
       est_refine_iter: int = 5,
       init_strategy: str = "default",
       coarse_refine_iter: int = 1,
       coarse_score_filter: str = "none",
       coarse_score_top_k: int = 999999,
+      fine_stage_enabled: bool = True,
       fine_refine_iter: int = 2,
       fine_top_k: int = 16,
       axis_prior_filter: str = "none",
@@ -148,10 +195,27 @@ class FoundationPoseRealtimeTracker:
       axis_prior_visualization_top_n: int = 24,
       axis_prior_visualization_boundary_margin: int = 6,
       axis_prior_visualization_max_records: int = 20,
+      network_input_capture: dict | None = None,
+      render_profile_enabled: bool = False,
+      render_batched_matmul_enabled: bool = False,
+      scorer_precomputed_xyz_enabled: bool = False,
+      refiner_stage1_optimizations_enabled: bool = False,
+      refiner_shared_warp_grid_enabled: bool = False,
+      scorer_shared_warp_grid_enabled: bool = False,
+      scorer_skip_unused_depth_warp_enabled: bool = False,
+      tensorrt_backends: dict | None = None,
+      refiner_input_sizes: dict | None = None,
       track_refine_iter: int = 2,
       vis_mode: str = "box",
       contour_thickness: int = 3,
       axis_scale: float = 0.1,
+      skip_redundant_coarse_scorer: bool = False,
+      network_internal_sync_enabled: bool = True,
+      frame_statistics_reuse_enabled: bool = False,
+      quality_render_mask_reuse_enabled: bool = False,
+      render_lod: dict | None = None,
+      candidate_pipeline_debug_enabled: bool = False,
+      distillation_capture: dict | None = None,
   ):
     set_logging_format()
     set_seed(0)
@@ -162,13 +226,26 @@ class FoundationPoseRealtimeTracker:
     self.use_float32_crop_window_patch = use_float32_crop_window_patch
     self.init_min_n_views = init_min_n_views
     self.init_inplane_step = init_inplane_step
+    self.initial_candidate_selection = dict(initial_candidate_selection or {})
+    self.initial_candidate_selection_info = None
+    self.translation_consensus_config = dict(translation_consensus or {})
+    self.candidate_predictability_shadow_config = dict(candidate_predictability_shadow or {})
+    self.single_candidate_mode_config = dict(single_candidate_mode or {})
     self.est_refine_iter = est_refine_iter
     self.init_strategy = init_strategy
     self.coarse_refine_iter = coarse_refine_iter
     self.coarse_score_filter = coarse_score_filter
     self.coarse_score_top_k = coarse_score_top_k
+    self.fine_stage_enabled = fine_stage_enabled
     self.fine_refine_iter = fine_refine_iter
     self.fine_top_k = fine_top_k
+    self.skip_redundant_coarse_scorer = skip_redundant_coarse_scorer
+    self.frame_statistics_reuse_enabled = frame_statistics_reuse_enabled
+    self.quality_render_mask_reuse_enabled = quality_render_mask_reuse_enabled
+    self.candidate_pipeline_debug_enabled = candidate_pipeline_debug_enabled
+    self.distillation_capture_config = dict(distillation_capture or {})
+    self.distillation_capture_enabled = bool(self.distillation_capture_config.get("enabled", False))
+    self.last_distillation_capture = None
     self.axis_prior_filter = axis_prior_filter
     self.axis_prior_model_axis = axis_prior_model_axis
     self.axis_prior_max_angle_deg = axis_prior_max_angle_deg
@@ -189,6 +266,19 @@ class FoundationPoseRealtimeTracker:
     self.axis_scale = axis_scale
     self.initialized = False
     self.last_pose = None
+    self.render_lod_config = dict(render_lod or {})
+    self.render_lod_requested = bool(self.render_lod_config.get("enabled", False))
+    self.render_lod_enabled = False
+    self.render_lod_mesh = None
+    self.render_lod_status = "disabled"
+    self.render_lod_fallback_reason = None
+    comparison_config = dict(self.render_lod_config.get("comparison", {}) or {})
+    self.render_lod_comparison_enabled = bool(comparison_config.get("enabled", False))
+    self.render_lod_comparison_dir = comparison_config.get("output_dir") or os.path.join(debug_dir, "render_lod_comparison")
+    self.render_lod_comparison_max_records = max(0, int(comparison_config.get("max_records", 5)))
+    self.render_lod_comparison_jpeg_quality = max(1, min(int(comparison_config.get("jpeg_quality", 95)), 100))
+    self._render_lod_comparison_run_id = time.strftime("run_%Y%m%d_%H%M%S")
+    self._render_lod_comparison_count = 0
 
     _set_crop_window_patch(self.use_float32_crop_window_patch)
 
@@ -201,8 +291,27 @@ class FoundationPoseRealtimeTracker:
     self.extents = np.asarray(self.extents, dtype=np.float32)
     self.bbox = np.stack([-self.extents / 2, self.extents / 2], axis=0).reshape(2, 3).astype(np.float32)
 
-    self.scorer = ScorePredictor()
-    self.refiner = PoseRefinePredictor()
+    tensorrt_backends = dict(tensorrt_backends or {})
+    self.scorer = ScorePredictor(
+      network_input_capture=network_input_capture,
+      tensorrt_backend=tensorrt_backends.get("scorer"),
+      render_profile_enabled=render_profile_enabled,
+      render_batched_matmul_enabled=render_batched_matmul_enabled,
+      scorer_precomputed_xyz_enabled=scorer_precomputed_xyz_enabled,
+      scorer_shared_warp_grid_enabled=scorer_shared_warp_grid_enabled,
+      scorer_skip_unused_depth_warp_enabled=scorer_skip_unused_depth_warp_enabled,
+      network_internal_sync_enabled=network_internal_sync_enabled,
+    )
+    self.refiner = PoseRefinePredictor(
+      network_input_capture=network_input_capture,
+      tensorrt_backend=tensorrt_backends.get("refiner"),
+      input_sizes=refiner_input_sizes,
+      render_profile_enabled=render_profile_enabled,
+      render_batched_matmul_enabled=render_batched_matmul_enabled,
+      refiner_stage1_optimizations_enabled=refiner_stage1_optimizations_enabled,
+      refiner_shared_warp_grid_enabled=refiner_shared_warp_grid_enabled,
+      network_internal_sync_enabled=network_internal_sync_enabled,
+    )
     self.glctx = dr.RasterizeCudaContext()
     self.estimator = FoundationPose(
         model_pts=self.mesh.vertices,
@@ -215,29 +324,442 @@ class FoundationPoseRealtimeTracker:
         glctx=self.glctx,
         init_min_n_views=self.init_min_n_views,
         init_inplane_step=self.init_inplane_step,
+        translation_consensus=self.translation_consensus_config,
     )
+    self._full_rotation_grid = self.estimator.rot_grid.detach().clone().contiguous()
+    self._full_rotation_candidate_source_indices = np.arange(
+        len(self._full_rotation_grid), dtype=np.int64
+    )
+    self._configure_initial_candidate_selection()
+    self.distillation_writer = DistillationCaptureWriter(
+        self.distillation_capture_config,
+        self._distillation_version_metadata() if self.distillation_capture_enabled else {},
+    )
+    self._configure_render_lod()
     self._ensure_estimator_float32()
+
+  def _configure_initial_candidate_selection(self) -> None:
+    enabled = bool(self.initial_candidate_selection.get("enabled", False))
+    full_count = int(len(self.estimator.rot_grid))
+    if not enabled:
+      self.initial_candidate_selection_info = {
+          "enabled": False,
+          "mode": "disabled",
+          "full_count": full_count,
+          "selected_count": full_count,
+      }
+      self.estimator.rotation_candidate_source_indices = np.arange(full_count, dtype=np.int64)
+      return
+
+    full_grid = self.estimator.rot_grid.detach().cpu().numpy()
+    mode = str(self.initial_candidate_selection.get("mode", "so3_farthest")).strip().lower()
+    if mode == "so3_farthest":
+      count = int(self.initial_candidate_selection.get("count", 5))
+      selection = select_so3_farthest_candidates(full_grid, count)
+    elif mode == "explicit_indices":
+      selection = select_explicit_candidates(
+          full_grid,
+          self.initial_candidate_selection.get("indices", ()),
+      )
+    else:
+      raise ValueError(f"Unsupported initial candidate selection mode {mode!r}")
+    selected_indices = torch.as_tensor(
+        selection.indices,
+        device=self.estimator.rot_grid.device,
+        dtype=torch.long,
+    )
+    self.estimator.rot_grid = self.estimator.rot_grid.index_select(0, selected_indices).contiguous()
+    self.estimator.rotation_candidate_source_indices = selection.indices.copy()
+    self.initial_candidate_selection_info = {
+        "enabled": True,
+        "mode": mode,
+        "full_count": full_count,
+        "selected_count": int(len(selection.indices)),
+        "selected_indices": selection.indices.tolist(),
+        "min_pairwise_angle_deg": selection.min_pairwise_angle_deg,
+    }
+    logging.info(
+        "[INITIAL_CANDIDATES] mode=%s full_count=%d selected_count=%d "
+        "selected_indices=%s min_pairwise_angle_deg=%.3f",
+        mode,
+        full_count,
+        len(selection.indices),
+        selection.indices.tolist(),
+        selection.min_pairwise_angle_deg,
+    )
+
+  def _select_registration_candidates(self, config: dict) -> tuple[torch.Tensor, np.ndarray]:
+    enabled = bool(config.get("enabled", False))
+    if not enabled:
+      return (
+          self._full_rotation_grid,
+          self._full_rotation_candidate_source_indices.copy(),
+      )
+    full_grid = self._full_rotation_grid.detach().cpu().numpy()
+    mode = str(config.get("mode", "so3_farthest")).strip().lower()
+    if mode == "so3_farthest":
+      selection = select_so3_farthest_candidates(full_grid, int(config.get("count", 5)))
+    elif mode == "explicit_indices":
+      selection = select_explicit_candidates(full_grid, config.get("indices", ()))
+    else:
+      raise ValueError(f"Unsupported registration candidate selection mode {mode!r}")
+    indices = torch.as_tensor(
+        selection.indices,
+        device=self._full_rotation_grid.device,
+        dtype=torch.long,
+    )
+    return (
+        self._full_rotation_grid.index_select(0, indices).contiguous(),
+        selection.indices.copy(),
+    )
+
+  def _distillation_version_metadata(self) -> dict:
+    pipeline_config = {
+        "init_strategy": self.init_strategy,
+        "est_refine_iter": self.est_refine_iter,
+        "coarse_refine_iter": self.coarse_refine_iter,
+        "coarse_score_filter": self.coarse_score_filter,
+        "coarse_score_top_k": self.coarse_score_top_k,
+        "fine_stage_enabled": self.fine_stage_enabled,
+        "fine_refine_iter": self.fine_refine_iter,
+        "fine_top_k": self.fine_top_k,
+        "axis_prior_filter": self.axis_prior_filter,
+        "axis_prior_model_axis": list(self.axis_prior_model_axis),
+        "axis_prior_max_angle_deg": self.axis_prior_max_angle_deg,
+        "axis_prior_min_candidates": self.axis_prior_min_candidates,
+        "axis_prior_max_candidates": self.axis_prior_max_candidates,
+        "axis_prior_min_points": self.axis_prior_min_points,
+        "axis_prior_min_confidence": self.axis_prior_min_confidence,
+        "track_refine_iter": self.track_refine_iter,
+        "skip_redundant_coarse_scorer": self.skip_redundant_coarse_scorer,
+        "refiner_input_sizes": {
+          str(stage): list(size)
+          for stage, size in self.refiner.input_sizes.items()
+        },
+    }
+
+    def engine_metadata(predictor) -> dict:
+      result = {}
+      for key, runner in getattr(predictor, "tensorrt_runners", {}).items():
+        result[str(key)] = {
+            "engine": _artifact_metadata(getattr(runner, "engine_path", None)),
+            "metadata": dict(getattr(runner, "metadata", {}) or {}),
+        }
+      return result
+
+    source_paths = (
+        Path(__file__).resolve(),
+        Path(FOUNDATIONPOSE_DIR) / "estimater.py",
+        Path(FOUNDATIONPOSE_DIR) / "learning/models/refine_network.py",
+        Path(FOUNDATIONPOSE_DIR) / "learning/training/predict_pose_refine.py",
+        Path(FOUNDATIONPOSE_DIR) / "learning/training/predict_score.py",
+        Path(__file__).with_name("distillation_capture.py").resolve(),
+    )
+    return {
+        "pipeline_config": pipeline_config,
+        "pipeline_config_sha256": _sha256_json(pipeline_config),
+        "mesh": _artifact_metadata(self.mesh_file),
+        "refiner": {
+          "run_name": self.refiner.run_name,
+          "checkpoint": _artifact_metadata(self.refiner.checkpoint_path),
+          "config": _artifact_metadata(self.refiner.config_path),
+          "tensorrt_engines": engine_metadata(self.refiner),
+        },
+        "scorer": {
+          "run_name": self.scorer.run_name,
+          "checkpoint": _artifact_metadata(self.scorer.checkpoint_path),
+          "config": _artifact_metadata(self.scorer.config_path),
+          "tensorrt_engines": engine_metadata(self.scorer),
+        },
+        "implementation": {
+          path.relative_to(REPO_ROOT).as_posix(): _artifact_metadata(path)
+          for path in source_paths
+        },
+        "environment": {
+          "python": platform.python_version(),
+          "platform": platform.platform(),
+          "torch": torch.__version__,
+          "torch_cuda": torch.version.cuda,
+          "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        },
+    }
+
+  def _configure_render_lod(self) -> None:
+    if not self.render_lod_requested:
+      return
+    try:
+      mesh_file = self.render_lod_config.get("mesh_file")
+      if not isinstance(mesh_file, str) or not mesh_file:
+        raise ValueError("foundationpose.render_lod.mesh_file must be configured")
+      if not os.path.isfile(mesh_file):
+        raise FileNotFoundError(f"LOD mesh does not exist: {mesh_file}")
+
+      stage_config = self.render_lod_config.get("stages", {}) or {}
+      if not isinstance(stage_config, dict):
+        raise ValueError("foundationpose.render_lod.stages must be a mapping")
+      unknown_stages = set(stage_config) - _RENDER_LOD_STAGE_NAMES
+      if unknown_stages:
+        raise ValueError(f"Unknown LOD render stages: {sorted(unknown_stages)}")
+      enabled_stages = {stage for stage, enabled in stage_config.items() if bool(enabled)}
+      if not enabled_stages:
+        raise ValueError("No LOD render stages are enabled")
+
+      loaded = trimesh.load(mesh_file, force="mesh", process=False)
+      if not isinstance(loaded, trimesh.Trimesh):
+        raise TypeError(f"LOD file must contain one triangle mesh, got {type(loaded).__name__}")
+      lod_mesh = loaded.copy()
+      lod_mesh.vertices = np.asarray(lod_mesh.vertices, dtype=np.float32)
+      self._validate_render_lod_mesh(lod_mesh)
+      lod_mesh.vertices = np.ascontiguousarray(
+          lod_mesh.vertices - np.asarray(self.estimator.model_center, dtype=np.float32).reshape(1, 3),
+          dtype=np.float32,
+      )
+      self.estimator.configure_render_lod(lod_mesh, enabled_stages)
+      self.render_lod_mesh = lod_mesh
+      self.render_lod_enabled = True
+      self.render_lod_status = "enabled"
+      original_faces = int(len(self.estimator.mesh.faces))
+      lod_faces = int(len(lod_mesh.faces))
+      print(
+          f"[RenderLOD] enabled: original={original_faces} triangles, LOD={lod_faces} triangles, "
+          f"stages={sorted(enabled_stages)}"
+      )
+    except Exception as exc:
+      self.estimator.clear_render_lod()
+      self.render_lod_enabled = False
+      self.render_lod_mesh = None
+      self.render_lod_status = "fallback_original"
+      self.render_lod_fallback_reason = str(exc)
+      logging.warning("Render LOD disabled; falling back to the original mesh: %s", exc)
+
+  def _validate_render_lod_mesh(self, lod_mesh: trimesh.Trimesh) -> None:
+    validation = dict(self.render_lod_config.get("validation", {}) or {})
+    vertices = np.asarray(lod_mesh.vertices)
+    faces = np.asarray(lod_mesh.faces)
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 3:
+      raise ValueError(f"LOD vertices have invalid shape: {vertices.shape}")
+    if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) < 1:
+      raise ValueError(f"LOD faces have invalid shape: {faces.shape}")
+    if not np.isfinite(vertices).all():
+      raise ValueError("LOD vertices contain NaN or infinity")
+    if faces.min() < 0 or faces.max() >= len(vertices):
+      raise ValueError("LOD face indices are outside the vertex array")
+
+    original_faces = max(1, int(len(self.mesh.faces)))
+    face_ratio = len(faces) / original_faces
+    max_face_ratio = float(validation.get("max_face_ratio", 0.75))
+    if face_ratio > max_face_ratio:
+      raise ValueError(
+          f"LOD triangle ratio {face_ratio:.3f} exceeds max_face_ratio={max_face_ratio:.3f}"
+      )
+
+    original_bounds = np.asarray(self.mesh.bounds, dtype=np.float64)
+    lod_bounds = np.asarray(lod_mesh.bounds, dtype=np.float64)
+    original_extent = original_bounds[1] - original_bounds[0]
+    lod_extent = lod_bounds[1] - lod_bounds[0]
+    original_diagonal = max(float(np.linalg.norm(original_extent)), 1e-9)
+    center_delta_ratio = float(np.linalg.norm(lod_bounds.mean(axis=0) - original_bounds.mean(axis=0)) / original_diagonal)
+    extent_delta_ratio = float(np.max(np.abs(lod_extent - original_extent)) / original_diagonal)
+    max_center_delta_ratio = float(validation.get("max_center_delta_ratio", 0.01))
+    max_extent_delta_ratio = float(validation.get("max_extent_delta_ratio", 0.03))
+    if center_delta_ratio > max_center_delta_ratio:
+      raise ValueError(
+          f"LOD center delta ratio {center_delta_ratio:.6f} exceeds {max_center_delta_ratio:.6f}"
+      )
+    if extent_delta_ratio > max_extent_delta_ratio:
+      raise ValueError(
+          f"LOD extent delta ratio {extent_delta_ratio:.6f} exceeds {max_extent_delta_ratio:.6f}"
+      )
+
+    if bool(validation.get("require_texture", True)):
+      if not isinstance(lod_mesh.visual, trimesh.visual.texture.TextureVisuals):
+        raise ValueError("LOD mesh does not contain texture visuals")
+      uv = np.asarray(lod_mesh.visual.uv)
+      if uv.shape != (len(vertices), 2) or not np.isfinite(uv).all():
+        raise ValueError(f"LOD UV array has invalid shape or values: {uv.shape}")
+      image = getattr(lod_mesh.visual.material, "image", None)
+      if image is None:
+        raise ValueError("LOD material does not contain a texture image")
+      image_array = np.asarray(image)
+      min_texture_size = int(validation.get("min_texture_size", 16))
+      if image_array.ndim < 2 or min(image_array.shape[:2]) < min_texture_size:
+        raise ValueError(
+            f"LOD texture is only {image_array.shape[:2]}; expected at least "
+            f"{min_texture_size}x{min_texture_size}"
+        )
+
+  def save_render_lod_comparison(
+      self,
+      color: np.ndarray,
+      K: np.ndarray,
+      frame_id: int | None = None,
+      centered_pose: np.ndarray | None = None,
+  ) -> str | None:
+    if not self.render_lod_enabled or not self.render_lod_comparison_enabled:
+      return None
+    if self._render_lod_comparison_count >= self.render_lod_comparison_max_records:
+      return None
+    if centered_pose is None:
+      centered_pose = self.estimator.pose_last
+    if centered_pose is None:
+      return None
+
+    color = np.ascontiguousarray(color, dtype=np.uint8)
+    K = np.ascontiguousarray(K, dtype=np.float32)
+    if torch.is_tensor(centered_pose):
+      centered_pose = centered_pose.detach().cpu().numpy()
+    centered_pose = np.ascontiguousarray(centered_pose, dtype=np.float32).reshape(4, 4)
+    pose_tensor = torch.as_tensor(centered_pose, device="cuda", dtype=torch.float32).reshape(1, 4, 4)
+    original_mask, original_depth = nvdiffrast_render_mask(
+        K=K,
+        H=color.shape[0],
+        W=color.shape[1],
+        ob_in_cams=pose_tensor,
+        glctx=self.glctx,
+        mesh_tensors=self.estimator.mesh_tensors,
+        return_depth=True,
+    )
+    lod_mask, lod_depth = nvdiffrast_render_mask(
+        K=K,
+        H=color.shape[0],
+        W=color.shape[1],
+        ob_in_cams=pose_tensor,
+        glctx=self.glctx,
+        mesh_tensors=self.estimator.render_lod_mesh_tensors,
+        return_depth=True,
+    )
+    original_mask = original_mask[0].astype(bool)
+    lod_mask = lod_mask[0].astype(bool)
+    original_depth = original_depth[0]
+    lod_depth = lod_depth[0]
+    overlap = original_mask & lod_mask
+    union = original_mask | lod_mask
+    original_only = original_mask & ~lod_mask
+    lod_only = lod_mask & ~original_mask
+    depth_difference_mm = np.zeros_like(original_depth, dtype=np.float32)
+    depth_difference_mm[overlap] = np.abs(original_depth[overlap] - lod_depth[overlap]) * 1000.0
+    overlap_depth_difference = depth_difference_mm[overlap]
+    metrics = {
+        "original_triangles": int(len(self.estimator.mesh.faces)),
+        "lod_triangles": int(len(self.render_lod_mesh.faces)),
+        "mask_iou": float(overlap.sum() / union.sum()) if union.any() else 1.0,
+        "original_mask_pixels": int(original_mask.sum()),
+        "lod_mask_pixels": int(lod_mask.sum()),
+        "original_only_pixels": int(original_only.sum()),
+        "lod_only_pixels": int(lod_only.sum()),
+        "mean_depth_difference_mm": float(overlap_depth_difference.mean()) if overlap_depth_difference.size else None,
+        "p95_depth_difference_mm": float(np.percentile(overlap_depth_difference, 95)) if overlap_depth_difference.size else None,
+        "max_depth_difference_mm": float(overlap_depth_difference.max()) if overlap_depth_difference.size else None,
+    }
+
+    def draw_contour(mask: np.ndarray, color_value: tuple[int, int, int], title: str) -> np.ndarray:
+      panel = color.copy()
+      contours, _ = cv2.findContours(mask.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+      if contours:
+        cv2.drawContours(panel, contours, -1, color_value, self.contour_thickness, cv2.LINE_AA)
+      return self._label_render_lod_panel(panel, title)
+
+    original_panel = draw_contour(original_mask, (0, 255, 255), "Original mesh contour")
+    lod_panel = draw_contour(lod_mask, (255, 255, 0), "LOD mesh contour")
+    difference_panel = (color.astype(np.float32) * 0.35).astype(np.uint8)
+    difference_panel[overlap] = (0, 190, 0)
+    difference_panel[original_only] = (255, 0, 0)
+    difference_panel[lod_only] = (0, 0, 255)
+    difference_panel = self._label_render_lod_panel(
+        difference_panel,
+        f"Mask overlap: green | original-only: red | LOD-only: blue | IoU={metrics['mask_iou']:.4f}",
+    )
+    display_max_mm = max(1.0, float(np.percentile(overlap_depth_difference, 99)) if overlap_depth_difference.size else 1.0)
+    normalized_depth = np.clip(depth_difference_mm / display_max_mm * 255.0, 0.0, 255.0).astype(np.uint8)
+    depth_panel = cv2.applyColorMap(normalized_depth, cv2.COLORMAP_TURBO)[..., ::-1]
+    depth_panel[~overlap] = (0, 0, 0)
+    depth_panel = self._label_render_lod_panel(
+        depth_panel,
+        f"Depth |original-LOD| (0-{display_max_mm:.2f} mm)",
+    )
+    comparison = np.concatenate(
+        (
+            np.concatenate((original_panel, lod_panel), axis=1),
+            np.concatenate((difference_panel, depth_panel), axis=1),
+        ),
+        axis=0,
+    )
+
+    record_index = self._render_lod_comparison_count + 1
+    frame_suffix = "unknown" if frame_id is None else f"{int(frame_id):06d}"
+    record_dir = os.path.join(
+        self.render_lod_comparison_dir,
+        self._render_lod_comparison_run_id,
+        f"register_{record_index:04d}_frame_{frame_suffix}",
+    )
+    os.makedirs(record_dir, exist_ok=True)
+    comparison_path = os.path.join(record_dir, "comparison.jpg")
+    if not cv2.imwrite(
+        comparison_path,
+        np.ascontiguousarray(comparison[..., ::-1]),
+        [cv2.IMWRITE_JPEG_QUALITY, self.render_lod_comparison_jpeg_quality],
+    ):
+      raise RuntimeError(f"cv2.imwrite failed: {comparison_path}")
+    np.savez_compressed(
+        os.path.join(record_dir, "render_data.npz"),
+        K=K,
+        centered_pose=centered_pose,
+        original_mask=original_mask.astype(np.uint8),
+        lod_mask=lod_mask.astype(np.uint8),
+        original_depth=original_depth.astype(np.float32),
+        lod_depth=lod_depth.astype(np.float32),
+    )
+    with open(os.path.join(record_dir, "summary.json"), "w", encoding="utf-8") as file:
+      json.dump(metrics, file, indent=2, ensure_ascii=False)
+    self._render_lod_comparison_count = record_index
+    print(f"[RenderLOD] Saved runtime comparison: {comparison_path}")
+    return comparison_path
+
+  @staticmethod
+  def _label_render_lod_panel(image: np.ndarray, text: str) -> np.ndarray:
+    output = np.ascontiguousarray(image, dtype=np.uint8)
+    cv2.putText(output, text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(output, text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
+    return output
 
   def reset(self) -> None:
     self.initialized = False
     self.last_pose = None
     self.estimator.pose_last = None
 
-  def register(self, color: np.ndarray, depth: np.ndarray, K: np.ndarray, mask: np.ndarray) -> PoseResult:
+  def register(self, color: np.ndarray, depth: np.ndarray, K: np.ndarray, mask: np.ndarray, frame_id: int | None = None, timestamp: float | None = None, object_id: object | None = None, sequence_id: object | None = None, capture_source: str = "runtime", registration_profile: dict | None = None) -> PoseResult:
     color, depth, K = self._prepare_frame_inputs(color, depth, K)
     mask = self._valid_mask(mask, depth)
-    pose = self.estimator.register(
+    profile = dict(registration_profile or {})
+    original_rot_grid = self.estimator.rot_grid
+    original_source_indices = self.estimator.rotation_candidate_source_indices
+    original_consensus_config = self.estimator.translation_consensus_config
+    if registration_profile is not None:
+      candidate_grid, source_indices = self._select_registration_candidates(
+        dict(profile.get("initial_candidate_selection", self.initial_candidate_selection) or {})
+      )
+      self.estimator.rot_grid = candidate_grid
+      self.estimator.rotation_candidate_source_indices = source_indices
+      self.estimator.translation_consensus_config = dict(
+        profile.get("translation_consensus", self.translation_consensus_config) or {}
+      )
+    try:
+      pose = self.estimator.register(
         K=K,
         rgb=color,
         depth=depth,
         ob_mask=mask,
-        iteration=self.est_refine_iter,
-        init_strategy=self.init_strategy,
-        coarse_refine_iter=self.coarse_refine_iter,
-        coarse_score_filter=self.coarse_score_filter,
-        coarse_score_top_k=self.coarse_score_top_k,
-        fine_refine_iter=self.fine_refine_iter,
-        fine_top_k=self.fine_top_k,
+        iteration=int(profile.get("est_refine_iter", self.est_refine_iter)),
+        init_strategy=profile.get("init_strategy", self.init_strategy),
+        coarse_refine_iter=int(profile.get("coarse_refine_iter", self.coarse_refine_iter)),
+        coarse_score_filter=profile.get("coarse_score_filter", self.coarse_score_filter),
+        coarse_score_top_k=int(profile.get("coarse_score_top_k", self.coarse_score_top_k)),
+        fine_stage_enabled=bool(profile.get("fine_stage_enabled", self.fine_stage_enabled)),
+        fine_refine_iter=int(profile.get("fine_refine_iter", self.fine_refine_iter)),
+        fine_top_k=int(profile.get("fine_top_k", self.fine_top_k)),
+        skip_redundant_coarse_scorer=bool(
+          profile.get("skip_redundant_coarse_scorer", self.skip_redundant_coarse_scorer)
+        ),
         axis_prior_filter=self.axis_prior_filter,
         axis_prior_model_axis=self.axis_prior_model_axis,
         axis_prior_max_angle_deg=self.axis_prior_max_angle_deg,
@@ -246,7 +768,33 @@ class FoundationPoseRealtimeTracker:
         axis_prior_min_points=self.axis_prior_min_points,
         axis_prior_min_confidence=self.axis_prior_min_confidence,
         axis_prior_debug=self.axis_prior_visualization_enabled,
+        frame_statistics_reuse_enabled=self.frame_statistics_reuse_enabled,
+        candidate_pipeline_debug_enabled=self.candidate_pipeline_debug_enabled,
+        distillation_capture_enabled=self.distillation_capture_enabled,
+        candidate_predictability_shadow=dict(
+          profile.get(
+            "candidate_predictability_shadow",
+            self.candidate_predictability_shadow_config,
+          ) or {}
+        ),
+        single_candidate_mode=dict(
+          profile.get("single_candidate_mode", self.single_candidate_mode_config) or {}
+        ),
+      )
+    finally:
+      self.estimator.rot_grid = original_rot_grid
+      self.estimator.rotation_candidate_source_indices = original_source_indices
+      self.estimator.translation_consensus_config = original_consensus_config
+    self.last_distillation_capture = self.distillation_writer.write_group(
+        getattr(self.estimator, "last_distillation_group", None),
+        frame_id=frame_id,
+        timestamp=timestamp,
+        object_id=object_id if object_id is not None else os.path.basename(self.mesh_file),
+        sequence_id=sequence_id,
+        source=capture_source,
     )
+    if self.distillation_writer.last_error is not None:
+      logging.warning(f"Distillation group was not saved: {self.distillation_writer.last_error}")
     if self.axis_prior_visualization_enabled:
       try:
         self._save_axis_prior_visualization(color, K, mask)
@@ -264,22 +812,27 @@ class FoundationPoseRealtimeTracker:
     self.last_pose = pose
     return PoseResult(pose=pose, initialized=True, mode="track")
 
-  def render_pose_mask(self, K: np.ndarray, image_shape: tuple[int, int], pose: np.ndarray | None = None) -> np.ndarray:
+  def render_pose_mask(
+      self,
+      K: np.ndarray,
+      image_shape: tuple[int, int],
+      pose: np.ndarray | None = None,
+      return_torch: bool = False,
+  ) -> np.ndarray | torch.Tensor:
     pose_to_render = self.estimator.pose_last if pose is None else pose
     K = np.ascontiguousarray(K, dtype=np.float32)
     height, width = image_shape[:2]
     ob_in_cams = torch.as_tensor(pose_to_render, device="cuda", dtype=torch.float).reshape(1, 4, 4)
-    _, render_depth, _ = nvdiffrast_render(
+    rendered_masks = nvdiffrast_render_mask(
         K=K,
         H=height,
         W=width,
         ob_in_cams=ob_in_cams,
         glctx=self.glctx,
         mesh_tensors=self.estimator.mesh_tensors,
-        output_size=np.asarray([height, width]),
-        use_light=False,
+        return_torch=return_torch,
     )
-    return (render_depth[0].detach().cpu().numpy() > 0.001).astype(np.uint8)
+    return rendered_masks[0]
 
   def _render_pose_masks(self, K: np.ndarray, image_shape: tuple[int, int], poses: np.ndarray) -> np.ndarray:
     K = np.ascontiguousarray(K, dtype=np.float32)
@@ -485,14 +1038,42 @@ class FoundationPoseRealtimeTracker:
       json.dump(summary, file, indent=2, ensure_ascii=False)
     print(f"[AxisPriorDebug] Saved candidate visualization: {record_dir}")
 
-  def mask_iou(self, K: np.ndarray, image_shape: tuple[int, int], target_mask: np.ndarray) -> float:
+  def mask_iou(self, K: np.ndarray, image_shape: tuple[int, int], target_mask: np.ndarray, rendered_mask: np.ndarray | None = None) -> float:
     if not self.initialized:
       return 0.0
-    rendered_mask = self.render_pose_mask(K, image_shape)
+    if rendered_mask is None:
+      rendered_mask = self.render_pose_mask(K, image_shape)
+    rendered_mask = np.ascontiguousarray(rendered_mask > 0, dtype=np.uint8)
     target = np.ascontiguousarray(target_mask > 0, dtype=np.uint8)
     intersection = np.logical_and(rendered_mask > 0, target > 0).sum()
     union = np.logical_or(rendered_mask > 0, target > 0).sum()
     return float(intersection / union) if union > 0 else 0.0
+
+  def mask_iou_gpu(
+      self,
+      target_mask: np.ndarray | torch.Tensor,
+      rendered_mask: torch.Tensor,
+  ) -> torch.Tensor:
+    if not self.initialized:
+      return torch.zeros((), device=rendered_mask.device, dtype=torch.float32)
+    rendered = rendered_mask.to(dtype=torch.bool)
+    if torch.is_tensor(target_mask):
+      target = target_mask.to(device=rendered.device, dtype=torch.bool)
+    else:
+      target = torch.as_tensor(
+          np.ascontiguousarray(target_mask),
+          device=rendered.device,
+          dtype=torch.bool,
+      )
+    if rendered.shape != target.shape:
+      raise ValueError(f"rendered/target mask shape mismatch: rendered={tuple(rendered.shape)}, target={tuple(target.shape)}")
+    intersection = torch.count_nonzero(rendered & target)
+    union = torch.count_nonzero(rendered | target)
+    return torch.where(
+        union > 0,
+        intersection.to(dtype=torch.float32) / union.to(dtype=torch.float32),
+        torch.zeros((), device=rendered.device, dtype=torch.float32),
+    )
 
   def draw_visualization(
       self,
@@ -500,6 +1081,7 @@ class FoundationPoseRealtimeTracker:
       K: np.ndarray,
       pose: np.ndarray | None = None,
       centered_pose: np.ndarray | None = None,
+      rendered_mask: np.ndarray | None = None,
   ) -> np.ndarray:
     color = np.ascontiguousarray(color, dtype=np.uint8)
     K = np.ascontiguousarray(K, dtype=np.float32)
@@ -513,7 +1095,14 @@ class FoundationPoseRealtimeTracker:
     if self.vis_mode in ("box", "both"):
       vis = draw_posed_3d_box(K, img=vis, ob_in_cam=center_pose, bbox=self.bbox)
     if self.vis_mode in ("contour", "both"):
-      contour_mask = self.render_pose_mask(K, color.shape[:2], pose=centered_pose) * 255
+      if rendered_mask is None:
+        rendered_mask = self.render_pose_mask(K, color.shape[:2], pose=centered_pose)
+      if torch.is_tensor(rendered_mask):
+        rendered_mask = rendered_mask.detach().to(device="cpu", dtype=torch.uint8).numpy()
+      rendered_mask = np.asarray(rendered_mask)
+      if rendered_mask.shape != color.shape[:2]:
+        raise ValueError(f"rendered mask/image shape mismatch: mask={rendered_mask.shape}, image={color.shape[:2]}")
+      contour_mask = np.ascontiguousarray(rendered_mask > 0, dtype=np.uint8) * 255
       contours, _ = cv2.findContours(contour_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
       if contours:
         cv2.drawContours(vis, contours, -1, color=(255, 255, 0), thickness=self.contour_thickness, lineType=cv2.LINE_AA)
@@ -549,3 +1138,7 @@ class FoundationPoseRealtimeTracker:
     for key, value in self.estimator.mesh_tensors.items():
       if torch.is_tensor(value) and value.is_floating_point():
         self.estimator.mesh_tensors[key] = value.float().contiguous()
+    if self.estimator.render_lod_mesh_tensors is not None:
+      for key, value in self.estimator.render_lod_mesh_tensors.items():
+        if torch.is_tensor(value) and value.is_floating_point():
+          self.estimator.render_lod_mesh_tensors[key] = value.float().contiguous()

@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import math
+import os
+from pathlib import Path
+import shlex
+import sys
+
+import yaml
+
+
+SCRIPT_PATH = Path(__file__).resolve()
+DEFAULT_CONFIG_PATH = SCRIPT_PATH.parents[1] / "config.yaml"
+DEFAULT_ROS_SETUP = Path("/opt/ros/humble/setup.bash")
+SUPPRESSED_TOPIC_SUFFIXES = (
+  "color/metadata",
+  "depth/camera_info",
+  "depth/image_rect_raw",
+  "depth/metadata",
+  "extrinsics/depth_to_color",
+)
+
+
+def parse_args() -> argparse.Namespace:
+  parser = argparse.ArgumentParser(
+      description="Start the configured RealSense ROS 2 color and aligned-depth publishers."
+  )
+  parser.add_argument(
+      "--config",
+      type=Path,
+      default=DEFAULT_CONFIG_PATH,
+      help=f"Runtime YAML configuration (default: {DEFAULT_CONFIG_PATH})",
+  )
+  parser.add_argument(
+      "--ros-setup",
+      type=Path,
+      default=DEFAULT_ROS_SETUP,
+      help=f"ROS 2 setup script (default: {DEFAULT_ROS_SETUP})",
+  )
+  parser.add_argument(
+      "--dry-run",
+      action="store_true",
+      help="Validate the configuration and print the ros2 launch command without starting the camera.",
+  )
+  return parser.parse_args()
+
+
+def load_config(path: Path) -> dict:
+  resolved_path = path.expanduser().resolve()
+  if not resolved_path.is_file():
+    raise RuntimeError(f"Configuration file does not exist: {resolved_path}")
+  with resolved_path.open("r", encoding="utf-8") as file:
+    config = yaml.safe_load(file) or {}
+  if not isinstance(config, dict):
+    raise RuntimeError(f"Configuration root must be a YAML mapping: {resolved_path}")
+  return config
+
+
+def require_mapping(value, name: str) -> dict:
+  if not isinstance(value, dict):
+    raise RuntimeError(f"{name} must be a YAML mapping")
+  return value
+
+
+def require_positive_int(config: dict, name: str) -> int:
+  try:
+    value = int(config[name])
+  except (KeyError, TypeError, ValueError) as exc:
+    raise RuntimeError(f"camera.{name} must be a positive integer") from exc
+  if value <= 0:
+    raise RuntimeError(f"camera.{name} must be a positive integer")
+  return value
+
+
+def require_cpu_cores(config: dict, name: str) -> list[int]:
+  value = config.get(name)
+  if not isinstance(value, list) or not value:
+    raise RuntimeError(f"camera.ros2.{name} must be a non-empty list")
+  try:
+    cores = [int(core) for core in value]
+  except (TypeError, ValueError) as exc:
+    raise RuntimeError(f"camera.ros2.{name} must contain integer CPU core indices") from exc
+  if any(core < 0 for core in cores) or len(set(cores)) != len(cores):
+    raise RuntimeError(f"camera.ros2.{name} must contain unique non-negative CPU core indices")
+  return cores
+
+
+def as_bool(value, name: str) -> bool:
+  if not isinstance(value, bool):
+    raise RuntimeError(f"camera.ros2.{name} must be true or false")
+  return value
+
+
+def optional_bool(config: dict, name: str) -> bool | None:
+  value = config.get(name)
+  if value is None:
+    return None
+  return as_bool(value, name)
+
+
+def optional_non_negative_int(config: dict, name: str) -> int | None:
+  value = config.get(name)
+  if value is None:
+    return None
+  if isinstance(value, bool):
+    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative integer")
+  try:
+    integer_value = int(value)
+  except (TypeError, ValueError) as exc:
+    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative integer") from exc
+  if integer_value < 0:
+    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative integer")
+  return integer_value
+
+
+def optional_non_negative_exposure_ms(config: dict, name: str) -> int | None:
+  value = config.get(name)
+  if value is None:
+    return None
+  if isinstance(value, bool):
+    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative number")
+  try:
+    milliseconds = float(value)
+  except (TypeError, ValueError) as exc:
+    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative number") from exc
+  if not math.isfinite(milliseconds) or milliseconds < 0:
+    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative number")
+  return round(milliseconds * 1000)
+
+
+def bool_text(value: bool) -> str:
+  return "true" if value else "false"
+
+
+def normalized_namespace(value) -> str:
+  if value is None:
+    return ""
+  if not isinstance(value, str):
+    raise RuntimeError("camera.ros2.camera_namespace must be a string")
+  return value.strip().strip("/")
+
+
+def expected_topic_prefix(namespace: str, camera_name: str) -> str:
+  parts = [part for part in (namespace, camera_name) if part]
+  return "/" + "/".join(parts)
+
+
+def validate_topics(ros2_config: dict, topic_prefix: str) -> dict[str, str]:
+  expected_topics = {
+      "color_topic": f"{topic_prefix}/color/image_raw",
+      "depth_topic": f"{topic_prefix}/aligned_depth_to_color/image_raw",
+      "camera_info_topic": f"{topic_prefix}/color/camera_info",
+  }
+  configured_topics = {}
+  for name, expected in expected_topics.items():
+    value = ros2_config.get(name)
+    if not isinstance(value, str) or not value.startswith("/"):
+      raise RuntimeError(f"camera.ros2.{name} must be an absolute ROS topic")
+    if value != expected:
+      raise RuntimeError(
+          f"camera.ros2.{name}={value!r} does not match camera_namespace/camera_name; expected {expected!r}"
+      )
+    configured_topics[name] = value
+  return configured_topics
+
+
+def append_exposure_parameters(command: list[str], ros2_config: dict) -> None:
+  for prefix, label in (("rgb_camera", "color"), ("depth_module", "depth")):
+    auto_exposure = optional_bool(ros2_config, f"{label}_auto_exposure")
+    exposure = optional_non_negative_int(ros2_config, f"{label}_exposure")
+    exposure_ms = optional_non_negative_exposure_ms(ros2_config, f"{label}_exposure_ms")
+    if exposure is not None and exposure_ms is not None:
+      raise RuntimeError(
+          f"camera.ros2.{label}_exposure and {label}_exposure_ms cannot both be set"
+      )
+    if exposure_ms is not None:
+      exposure = exposure_ms
+    gain = optional_non_negative_int(ros2_config, f"{label}_gain")
+    has_manual_setting = exposure is not None or gain is not None
+
+    if auto_exposure is True and has_manual_setting:
+      raise RuntimeError(
+          f"camera.ros2.{label}_auto_exposure cannot be true when "
+          f"{label}_exposure or {label}_gain is set"
+      )
+    if auto_exposure is not None or has_manual_setting:
+      # A manual option must not be immediately overwritten by the sensor's
+      # auto-exposure algorithm. Explicit config still takes precedence.
+      command.extend(
+          ("-p", f"{prefix}.enable_auto_exposure:={bool_text(auto_exposure if auto_exposure is not None else False)}")
+      )
+    if exposure is not None:
+      command.extend(("-p", f"{prefix}.exposure:={exposure}"))
+    if gain is not None:
+      command.extend(("-p", f"{prefix}.gain:={gain}"))
+
+
+def build_launch_command(
+  config: dict,
+) -> tuple[list[str], dict[str, str], list[tuple[str, str]]]:
+  camera_config = require_mapping(config.get("camera"), "camera")
+  ros2_config = require_mapping(camera_config.get("ros2"), "camera.ros2")
+  bridge_cpu_cores = require_cpu_cores(ros2_config, "bridge_cpu_cores")
+
+  width = require_positive_int(camera_config, "width")
+  height = require_positive_int(camera_config, "height")
+  fps = require_positive_int(camera_config, "fps")
+  namespace = normalized_namespace(ros2_config.get("camera_namespace", ""))
+  camera_name = ros2_config.get("camera_name")
+  if not isinstance(camera_name, str) or not camera_name.strip() or "/" in camera_name:
+    raise RuntimeError("camera.ros2.camera_name must be a non-empty ROS node name without '/'")
+  camera_name = camera_name.strip()
+
+  topic_prefix = expected_topic_prefix(namespace, camera_name)
+  topics = validate_topics(ros2_config, topic_prefix)
+  stream_profile = f"{width},{height},{fps}"
+  launch_namespace = namespace or "/"
+
+  command = [
+      "taskset",
+      "--cpu-list",
+      ",".join(str(core) for core in bridge_cpu_cores),
+      "ros2",
+      "run",
+      "realsense2_camera",
+      "realsense2_camera_node",
+      "--ros-args",
+      "--remap",
+      f"__ns:={launch_namespace}",
+      "--remap",
+      f"__node:={camera_name}",
+      "--log-level",
+      "info",
+      "-p",
+      f"camera_name:={camera_name}",
+      "-p",
+      f"camera_namespace:={launch_namespace}",
+      "-p",
+      f"enable_color:={bool_text(as_bool(ros2_config.get('enable_color', True), 'enable_color'))}",
+      "-p",
+      f"enable_depth:={bool_text(as_bool(ros2_config.get('enable_depth', True), 'enable_depth'))}",
+      "-p",
+      "enable_infra:=false",
+      "-p",
+      "enable_infra1:=false",
+      "-p",
+      "enable_infra2:=false",
+      "-p",
+      f"align_depth.enable:={bool_text(as_bool(ros2_config.get('align_depth', True), 'align_depth'))}",
+      "-p",
+      f"enable_sync:={bool_text(as_bool(ros2_config.get('enable_sync', True), 'enable_sync'))}",
+      "-p",
+      "enable_rgbd:=false",
+      "-p",
+      "enable_gyro:=false",
+      "-p",
+      "enable_accel:=false",
+      "-p",
+      "enable_motion:=false",
+      "-p",
+      "pointcloud.enable:=false",
+      "-p",
+      f"initial_reset:={bool_text(as_bool(ros2_config.get('initial_reset', False), 'initial_reset'))}",
+      "-p",
+      f"publish_tf:={bool_text(as_bool(ros2_config.get('publish_tf', True), 'publish_tf'))}",
+      "-p",
+      f"rgb_camera.color_profile:={stream_profile}",
+      "-p",
+      f"depth_module.depth_profile:={stream_profile}",
+  ]
+  append_exposure_parameters(command, ros2_config)
+  serial = camera_config.get("serial")
+  if serial is not None:
+    serial_text = str(serial).strip()
+    if not serial_text:
+      raise RuntimeError("camera.serial must be null or a non-empty serial number")
+    # ROS 2 parses an unquoted all-digit value as an integer.  RealSense expects
+    # `serial_no` to be a string, so retain YAML quotes in the parameter value.
+    command.extend(("-p", f"serial_no:='{serial_text}'"))
+
+  suppressed_topics = []
+  suppress_unused_topics = as_bool(
+      ros2_config.get("suppress_unused_topics", True), "suppress_unused_topics"
+  )
+  if suppress_unused_topics:
+    for suffix in SUPPRESSED_TOPIC_SUFFIXES:
+      source_topic = f"{topic_prefix}/{suffix}"
+      hidden_topic = f"{topic_prefix}/_suppressed/{suffix}"
+      command.extend(("--remap", f"{source_topic}:={hidden_topic}"))
+      suppressed_topics.append((source_topic, hidden_topic))
+  return command, topics, suppressed_topics
+
+
+def main() -> int:
+  args = parse_args()
+  try:
+    config_path = args.config.expanduser().resolve()
+    ros_setup = args.ros_setup.expanduser().resolve()
+    if not ros_setup.is_file():
+      raise RuntimeError(f"ROS 2 setup script does not exist: {ros_setup}")
+    command, topics, suppressed_topics = build_launch_command(load_config(config_path))
+  except (OSError, RuntimeError, yaml.YAMLError) as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    return 2
+
+  print(f"[depth_color_publish] config: {config_path}")
+  print(f"[depth_color_publish] color: {topics['color_topic']}")
+  print(f"[depth_color_publish] aligned depth: {topics['depth_topic']}")
+  print(f"[depth_color_publish] camera info: {topics['camera_info_topic']}")
+  for source_topic, hidden_topic in suppressed_topics:
+    print(f"[depth_color_publish] suppressed: {source_topic} -> {hidden_topic}")
+  print(f"[depth_color_publish] command: {shlex.join(command)}", flush=True)
+  if args.dry_run:
+    return 0
+
+  shell_command = 'source "$1" && shift && exec "$@"'
+  os.execv(
+      "/bin/bash",
+      ["bash", "-c", shell_command, "depth_color_publish", str(ros_setup), *command],
+  )
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

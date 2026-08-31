@@ -32,3 +32,20 @@ FoundationPose/bundlesdf/mycuda/build/
 FoundationPose/demo_data/**/*.zip
 FoundationPose/weights/
 FoundationPose/.git/
+
+# Generated model and inference artifacts
+*.engine
+*.plan
+*.trt
+*.safetensors
+*.weights
+
+# Local generated/runtime artifacts
+/.runtime_test/
+
+# Local Jetson offline dependency bundle
+/FoundationPose/docker/jetson_offline_jp61/
+
+# Generated inference engines, metadata and local weights
+/realtime_foundation/engine/
+/realtime_foundation/yolo_weights/
