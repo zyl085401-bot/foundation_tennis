@@ -1,0 +1,5 @@
+# Minimal runtime dependencies imported by mros communication and bag modules.
+# mros.flow/OpenAI dependencies are intentionally excluded from the realtime image.
+lz4==4.4.5
+pycryptodomex==3.23.0
+python-gnupg==0.5.6

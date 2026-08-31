@@ -5,27 +5,21 @@ import argparse
 import math
 import os
 from pathlib import Path
-import shlex
-import sys
+import time
 
+import numpy as np
 import yaml
+
+from realsense_reader import RealSenseReader
 
 
 SCRIPT_PATH = Path(__file__).resolve()
 DEFAULT_CONFIG_PATH = SCRIPT_PATH.parents[1] / "config.yaml"
-DEFAULT_ROS_SETUP = Path("/opt/ros/humble/setup.bash")
-SUPPRESSED_TOPIC_SUFFIXES = (
-  "color/metadata",
-  "depth/camera_info",
-  "depth/image_rect_raw",
-  "depth/metadata",
-  "extrinsics/depth_to_color",
-)
 
 
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(
-      description="Start the configured RealSense ROS 2 color and aligned-depth publishers."
+      description="Start the configured RealSense camera and publish RGB-D frames through mROS."
   )
   parser.add_argument(
       "--config",
@@ -34,15 +28,9 @@ def parse_args() -> argparse.Namespace:
       help=f"Runtime YAML configuration (default: {DEFAULT_CONFIG_PATH})",
   )
   parser.add_argument(
-      "--ros-setup",
-      type=Path,
-      default=DEFAULT_ROS_SETUP,
-      help=f"ROS 2 setup script (default: {DEFAULT_ROS_SETUP})",
-  )
-  parser.add_argument(
       "--dry-run",
       action="store_true",
-      help="Validate the configuration and print the ros2 launch command without starting the camera.",
+      help="Validate and print the mROS camera configuration without opening the camera.",
   )
   return parser.parse_args()
 
@@ -64,262 +52,373 @@ def require_mapping(value, name: str) -> dict:
   return value
 
 
-def require_positive_int(config: dict, name: str) -> int:
+def positive_int(config: dict, name: str, default: int) -> int:
   try:
-    value = int(config[name])
-  except (KeyError, TypeError, ValueError) as exc:
+    value = int(config.get(name, default))
+  except (TypeError, ValueError) as exc:
     raise RuntimeError(f"camera.{name} must be a positive integer") from exc
   if value <= 0:
     raise RuntimeError(f"camera.{name} must be a positive integer")
   return value
 
 
-def require_cpu_cores(config: dict, name: str) -> list[int]:
-  value = config.get(name)
-  if not isinstance(value, list) or not value:
-    raise RuntimeError(f"camera.ros2.{name} must be a non-empty list")
+def finite_float(config: dict, name: str, default: float) -> float:
   try:
-    cores = [int(core) for core in value]
+    value = float(config.get(name, default))
   except (TypeError, ValueError) as exc:
-    raise RuntimeError(f"camera.ros2.{name} must contain integer CPU core indices") from exc
-  if any(core < 0 for core in cores) or len(set(cores)) != len(cores):
-    raise RuntimeError(f"camera.ros2.{name} must contain unique non-negative CPU core indices")
-  return cores
-
-
-def as_bool(value, name: str) -> bool:
-  if not isinstance(value, bool):
-    raise RuntimeError(f"camera.ros2.{name} must be true or false")
+    raise RuntimeError(f"camera.{name} must be a finite number") from exc
+  if not math.isfinite(value):
+    raise RuntimeError(f"camera.{name} must be a finite number")
   return value
+
+
+def non_empty_string(config: dict, name: str, default: str | None = None) -> str:
+  value = config.get(name, default)
+  if not isinstance(value, str) or not value.strip():
+    raise RuntimeError(f"camera.mros.{name} must be a non-empty string")
+  return value.strip()
+
+
+def optional_non_negative_float(config: dict, name: str) -> float | None:
+  value = config.get(name)
+  if value is None:
+    return None
+  if isinstance(value, bool):
+    raise RuntimeError(f"camera.mros.{name} must be null or a non-negative number")
+  try:
+    result = float(value)
+  except (TypeError, ValueError) as exc:
+    raise RuntimeError(f"camera.mros.{name} must be null or a non-negative number") from exc
+  if result < 0.0 or not math.isfinite(result):
+    raise RuntimeError(f"camera.mros.{name} must be null or a non-negative number")
+  return result
 
 
 def optional_bool(config: dict, name: str) -> bool | None:
   value = config.get(name)
   if value is None:
     return None
-  return as_bool(value, name)
+  if not isinstance(value, bool):
+    raise RuntimeError(f"camera.mros.{name} must be true, false, or null")
+  return value
 
 
-def optional_non_negative_int(config: dict, name: str) -> int | None:
-  value = config.get(name)
-  if value is None:
-    return None
-  if isinstance(value, bool):
-    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative integer")
+def cpu_cores(config: dict) -> list[int]:
+  value = config.get("publisher_cpu_cores", config.get("bridge_cpu_cores", []))
+  if not isinstance(value, list) or not value:
+    raise RuntimeError("camera.mros.publisher_cpu_cores must be a non-empty list")
   try:
-    integer_value = int(value)
+    cores = [int(core) for core in value]
   except (TypeError, ValueError) as exc:
-    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative integer") from exc
-  if integer_value < 0:
-    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative integer")
-  return integer_value
+    raise RuntimeError("camera.mros.publisher_cpu_cores must contain integer indices") from exc
+  if any(core < 0 for core in cores) or len(set(cores)) != len(cores):
+    raise RuntimeError("camera.mros.publisher_cpu_cores must contain unique non-negative indices")
+  available = set(os.sched_getaffinity(0))
+  unavailable = sorted(set(cores) - available)
+  if unavailable:
+    raise RuntimeError(
+        f"Configured camera publisher CPU cores {unavailable} are unavailable; "
+        f"allowed cores={sorted(available)}"
+    )
+  return cores
 
 
-def optional_non_negative_exposure_ms(config: dict, name: str) -> int | None:
-  value = config.get(name)
-  if value is None:
-    return None
-  if isinstance(value, bool):
-    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative number")
-  try:
-    milliseconds = float(value)
-  except (TypeError, ValueError) as exc:
-    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative number") from exc
-  if not math.isfinite(milliseconds) or milliseconds < 0:
-    raise RuntimeError(f"camera.ros2.{name} must be null or a non-negative number")
-  return round(milliseconds * 1000)
+def build_runtime_config(config: dict) -> dict:
+  camera = require_mapping(config.get("camera"), "camera")
+  mros_config = require_mapping(camera.get("mros"), "camera.mros")
+  width = positive_int(camera, "width", 640)
+  height = positive_int(camera, "height", 480)
+  fps = positive_int(camera, "fps", 30)
+  depth_min = finite_float(camera, "depth_min", 0.001)
+  depth_max = finite_float(camera, "depth_max", 3.0)
+  if not 0.0 <= depth_min < depth_max:
+    raise RuntimeError("camera depth range must satisfy 0 <= depth_min < depth_max")
 
+  serial = camera.get("serial")
+  if serial is not None:
+    serial = str(serial).strip()
+    if not serial:
+      raise RuntimeError("camera.serial must be null or a non-empty serial number")
 
-def bool_text(value: bool) -> str:
-  return "true" if value else "false"
+  node_name = non_empty_string(
+      mros_config,
+      "publisher_node_name",
+      "foundationpose_rgbd_publisher",
+  )
+  frame_id = non_empty_string(mros_config, "frame_id", "camera_color_optical_frame")
+  queue_size = positive_int(mros_config, "publisher_queue_size", 2)
+  log_interval_sec = optional_non_negative_float(mros_config, "publisher_log_interval_sec")
+  if log_interval_sec is None:
+    log_interval_sec = 1.0
 
-
-def normalized_namespace(value) -> str:
-  if value is None:
-    return ""
-  if not isinstance(value, str):
-    raise RuntimeError("camera.ros2.camera_namespace must be a string")
-  return value.strip().strip("/")
-
-
-def expected_topic_prefix(namespace: str, camera_name: str) -> str:
-  parts = [part for part in (namespace, camera_name) if part]
-  return "/" + "/".join(parts)
-
-
-def validate_topics(ros2_config: dict, topic_prefix: str) -> dict[str, str]:
-  expected_topics = {
-      "color_topic": f"{topic_prefix}/color/image_raw",
-      "depth_topic": f"{topic_prefix}/aligned_depth_to_color/image_raw",
-      "camera_info_topic": f"{topic_prefix}/color/camera_info",
-  }
-  configured_topics = {}
-  for name, expected in expected_topics.items():
-    value = ros2_config.get(name)
-    if not isinstance(value, str) or not value.startswith("/"):
-      raise RuntimeError(f"camera.ros2.{name} must be an absolute ROS topic")
-    if value != expected:
+  exposure = {}
+  for stream in ("color", "depth"):
+    auto = optional_bool(mros_config, f"{stream}_auto_exposure")
+    exposure_ms = optional_non_negative_float(mros_config, f"{stream}_exposure_ms")
+    gain = optional_non_negative_float(mros_config, f"{stream}_gain")
+    if auto is True and (exposure_ms is not None or gain is not None):
       raise RuntimeError(
-          f"camera.ros2.{name}={value!r} does not match camera_namespace/camera_name; expected {expected!r}"
+          f"camera.mros.{stream}_auto_exposure cannot be true when manual exposure or gain is set"
       )
-    configured_topics[name] = value
-  return configured_topics
+    exposure[stream] = {
+        "auto": auto,
+        "exposure_ms": exposure_ms,
+        "gain": gain,
+    }
+
+  return {
+      "width": width,
+      "height": height,
+      "fps": fps,
+      "serial": serial,
+      "depth_min": depth_min,
+      "depth_max": depth_max,
+      "align_to_color": bool(camera.get("align_to_color", True)),
+      "reset_before_start": bool(camera.get("reset_before_start", True)),
+      "node_name": node_name,
+      "frame_id": frame_id,
+      "color_topic": non_empty_string(mros_config, "color_topic"),
+      "depth_topic": non_empty_string(mros_config, "depth_topic"),
+      "camera_info_topic": non_empty_string(mros_config, "camera_info_topic"),
+      "queue_size": queue_size,
+      "cpu_cores": cpu_cores(mros_config),
+      "log_interval_sec": log_interval_sec,
+      "exposure": exposure,
+  }
 
 
-def append_exposure_parameters(command: list[str], ros2_config: dict) -> None:
-  for prefix, label in (("rgb_camera", "color"), ("depth_module", "depth")):
-    auto_exposure = optional_bool(ros2_config, f"{label}_auto_exposure")
-    exposure = optional_non_negative_int(ros2_config, f"{label}_exposure")
-    exposure_ms = optional_non_negative_exposure_ms(ros2_config, f"{label}_exposure_ms")
-    if exposure is not None and exposure_ms is not None:
-      raise RuntimeError(
-          f"camera.ros2.{label}_exposure and {label}_exposure_ms cannot both be set"
+def _set_sensor_option(sensor, option, value, label: str) -> None:
+  if value is None:
+    return
+  if not sensor.supports(option):
+    raise RuntimeError(f"RealSense sensor does not support {label}")
+  option_range = sensor.get_option_range(option)
+  numeric_value = float(value)
+  if numeric_value < option_range.min or numeric_value > option_range.max:
+    raise RuntimeError(
+        f"RealSense {label}={numeric_value:g} is outside "
+        f"[{option_range.min:g}, {option_range.max:g}]"
+    )
+  sensor.set_option(option, numeric_value)
+
+
+def apply_exposure_settings(camera: RealSenseReader, exposure: dict) -> None:
+  device = camera.profile.get_device()
+  rs = camera.rs
+  sensors = {
+      "color": device.first_color_sensor(),
+      "depth": device.first_depth_sensor(),
+  }
+  for stream, sensor in sensors.items():
+    settings = exposure[stream]
+    auto = settings["auto"]
+    exposure_ms = settings["exposure_ms"]
+    gain = settings["gain"]
+    if auto is not None or exposure_ms is not None or gain is not None:
+      _set_sensor_option(
+          sensor,
+          rs.option.enable_auto_exposure,
+          1.0 if (auto if auto is not None else False) else 0.0,
+          f"{stream} auto exposure",
       )
     if exposure_ms is not None:
-      exposure = exposure_ms
-    gain = optional_non_negative_int(ros2_config, f"{label}_gain")
-    has_manual_setting = exposure is not None or gain is not None
-
-    if auto_exposure is True and has_manual_setting:
-      raise RuntimeError(
-          f"camera.ros2.{label}_auto_exposure cannot be true when "
-          f"{label}_exposure or {label}_gain is set"
+      _set_sensor_option(
+          sensor,
+          rs.option.exposure,
+          exposure_ms * 1000.0,
+          f"{stream} exposure (microseconds)",
       )
-    if auto_exposure is not None or has_manual_setting:
-      # A manual option must not be immediately overwritten by the sensor's
-      # auto-exposure algorithm. Explicit config still takes precedence.
-      command.extend(
-          ("-p", f"{prefix}.enable_auto_exposure:={bool_text(auto_exposure if auto_exposure is not None else False)}")
-      )
-    if exposure is not None:
-      command.extend(("-p", f"{prefix}.exposure:={exposure}"))
-    if gain is not None:
-      command.extend(("-p", f"{prefix}.gain:={gain}"))
+    _set_sensor_option(sensor, rs.option.gain, gain, f"{stream} gain")
 
 
-def build_launch_command(
-  config: dict,
-) -> tuple[list[str], dict[str, str], list[tuple[str, str]]]:
-  camera_config = require_mapping(config.get("camera"), "camera")
-  ros2_config = require_mapping(camera_config.get("ros2"), "camera.ros2")
-  bridge_cpu_cores = require_cpu_cores(ros2_config, "bridge_cpu_cores")
+def _new_stamp(mros, timestamp=None):
+  return mros.Time.now() if timestamp is None else timestamp
 
-  width = require_positive_int(camera_config, "width")
-  height = require_positive_int(camera_config, "height")
-  fps = require_positive_int(camera_config, "fps")
-  namespace = normalized_namespace(ros2_config.get("camera_namespace", ""))
-  camera_name = ros2_config.get("camera_name")
-  if not isinstance(camera_name, str) or not camera_name.strip() or "/" in camera_name:
-    raise RuntimeError("camera.ros2.camera_name must be a non-empty ROS node name without '/'")
-  camera_name = camera_name.strip()
 
-  topic_prefix = expected_topic_prefix(namespace, camera_name)
-  topics = validate_topics(ros2_config, topic_prefix)
-  stream_profile = f"{width},{height},{fps}"
-  launch_namespace = namespace or "/"
+def build_color_message(Image, mros, color: np.ndarray, sequence: int, frame_id: str, stamp=None):
+  image = np.asarray(color)
+  if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+    raise RuntimeError(f"Expected RGB uint8 HxWx3 image, got {image.shape}/{image.dtype}")
+  image = np.ascontiguousarray(image)
+  message = Image()
+  message.header.seq = int(sequence)
+  message.header.stamp = _new_stamp(mros, stamp)
+  message.header.frame_id = frame_id
+  message.height = int(image.shape[0])
+  message.width = int(image.shape[1])
+  message.encoding = "rgb8"
+  message.is_bigendian = 0
+  message.step = int(image.shape[1] * 3)
+  message.data = image.tobytes()
+  return message
 
-  command = [
-      "taskset",
-      "--cpu-list",
-      ",".join(str(core) for core in bridge_cpu_cores),
-      "ros2",
-      "run",
-      "realsense2_camera",
-      "realsense2_camera_node",
-      "--ros-args",
-      "--remap",
-      f"__ns:={launch_namespace}",
-      "--remap",
-      f"__node:={camera_name}",
-      "--log-level",
-      "info",
-      "-p",
-      f"camera_name:={camera_name}",
-      "-p",
-      f"camera_namespace:={launch_namespace}",
-      "-p",
-      f"enable_color:={bool_text(as_bool(ros2_config.get('enable_color', True), 'enable_color'))}",
-      "-p",
-      f"enable_depth:={bool_text(as_bool(ros2_config.get('enable_depth', True), 'enable_depth'))}",
-      "-p",
-      "enable_infra:=false",
-      "-p",
-      "enable_infra1:=false",
-      "-p",
-      "enable_infra2:=false",
-      "-p",
-      f"align_depth.enable:={bool_text(as_bool(ros2_config.get('align_depth', True), 'align_depth'))}",
-      "-p",
-      f"enable_sync:={bool_text(as_bool(ros2_config.get('enable_sync', True), 'enable_sync'))}",
-      "-p",
-      "enable_rgbd:=false",
-      "-p",
-      "enable_gyro:=false",
-      "-p",
-      "enable_accel:=false",
-      "-p",
-      "enable_motion:=false",
-      "-p",
-      "pointcloud.enable:=false",
-      "-p",
-      f"initial_reset:={bool_text(as_bool(ros2_config.get('initial_reset', False), 'initial_reset'))}",
-      "-p",
-      f"publish_tf:={bool_text(as_bool(ros2_config.get('publish_tf', True), 'publish_tf'))}",
-      "-p",
-      f"rgb_camera.color_profile:={stream_profile}",
-      "-p",
-      f"depth_module.depth_profile:={stream_profile}",
+
+def build_depth_message(Image, mros, depth: np.ndarray, sequence: int, frame_id: str, stamp=None):
+  image = np.asarray(depth, dtype=np.float32)
+  if image.ndim != 2:
+    raise RuntimeError(f"Expected float32 HxW depth image, got {image.shape}")
+  image = np.ascontiguousarray(image, dtype="<f4")
+  message = Image()
+  message.header.seq = int(sequence)
+  message.header.stamp = _new_stamp(mros, stamp)
+  message.header.frame_id = frame_id
+  message.height = int(image.shape[0])
+  message.width = int(image.shape[1])
+  message.encoding = "32FC1"
+  message.is_bigendian = 0
+  message.step = int(image.shape[1] * np.dtype(np.float32).itemsize)
+  message.data = image.tobytes()
+  return message
+
+
+def build_camera_info_message(
+    CameraInfo,
+    mros,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    sequence: int,
+    frame_id: str,
+    stamp=None,
+):
+  matrix = np.asarray(K, dtype=np.float64)
+  if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+    raise RuntimeError(f"Expected finite 3x3 camera matrix, got {matrix.shape}")
+  message = CameraInfo()
+  message.header.seq = int(sequence)
+  message.header.stamp = _new_stamp(mros, stamp)
+  message.header.frame_id = frame_id
+  message.height = int(height)
+  message.width = int(width)
+  message.distortion_model = "plumb_bob"
+  message.D = [0.0, 0.0, 0.0, 0.0, 0.0]
+  message.K = matrix.reshape(-1).tolist()
+  message.R = np.eye(3, dtype=np.float64).reshape(-1).tolist()
+  message.P = [
+      float(matrix[0, 0]), 0.0, float(matrix[0, 2]), 0.0,
+      0.0, float(matrix[1, 1]), float(matrix[1, 2]), 0.0,
+      0.0, 0.0, 1.0, 0.0,
   ]
-  append_exposure_parameters(command, ros2_config)
-  serial = camera_config.get("serial")
-  if serial is not None:
-    serial_text = str(serial).strip()
-    if not serial_text:
-      raise RuntimeError("camera.serial must be null or a non-empty serial number")
-    # ROS 2 parses an unquoted all-digit value as an integer.  RealSense expects
-    # `serial_no` to be a string, so retain YAML quotes in the parameter value.
-    command.extend(("-p", f"serial_no:='{serial_text}'"))
+  message.binning_x = 0
+  message.binning_y = 0
+  return message
 
-  suppressed_topics = []
-  suppress_unused_topics = as_bool(
-      ros2_config.get("suppress_unused_topics", True), "suppress_unused_topics"
+
+def run_publisher(runtime: dict) -> None:
+  try:
+    import mros
+    from mros.sensor_msgs.msg import CameraInfo, Image
+  except ImportError as exc:
+    raise RuntimeError("mROS Python package is unavailable") from exc
+
+  os.sched_setaffinity(0, runtime["cpu_cores"])
+  camera = RealSenseReader(
+      width=runtime["width"],
+      height=runtime["height"],
+      fps=runtime["fps"],
+      serial=runtime["serial"],
+      depth_min=runtime["depth_min"],
+      depth_max=runtime["depth_max"],
+      align_to_color=runtime["align_to_color"],
+      reset_before_start=runtime["reset_before_start"],
+      verbose=True,
   )
-  if suppress_unused_topics:
-    for suffix in SUPPRESSED_TOPIC_SUFFIXES:
-      source_topic = f"{topic_prefix}/{suffix}"
-      hidden_topic = f"{topic_prefix}/_suppressed/{suffix}"
-      command.extend(("--remap", f"{source_topic}:={hidden_topic}"))
-      suppressed_topics.append((source_topic, hidden_topic))
-  return command, topics, suppressed_topics
+
+  mros.init(runtime["node_name"])
+  try:
+    color_publisher = mros.advertise(
+        runtime["color_topic"], Image, False, runtime["queue_size"]
+    )
+    depth_publisher = mros.advertise(
+        runtime["depth_topic"], Image, False, runtime["queue_size"]
+    )
+    camera_info_publisher = mros.advertise(
+        runtime["camera_info_topic"], CameraInfo, False, 1
+    )
+    camera.start()
+    apply_exposure_settings(camera, runtime["exposure"])
+
+    print("[mROS RealSense] Publishers started")
+    print(f"  node: {runtime['node_name']}")
+    print(f"  color: {runtime['color_topic']} (rgb8)")
+    print(f"  aligned depth: {runtime['depth_topic']} (32FC1 meters)")
+    print(f"  camera info: {runtime['camera_info_topic']}")
+    print(f"  frame: {runtime['frame_id']}")
+    print(f"  CPU cores: {sorted(os.sched_getaffinity(0))}")
+
+    sequence = 0
+    last_log_time = time.monotonic()
+    published_since_log = 0
+    while mros.ok():
+      frame = camera.get_frame()
+      if frame is None:
+        continue
+      color, depth, K = frame
+      stamp = mros.Time.now()
+      color_message = build_color_message(
+          Image, mros, color, sequence, runtime["frame_id"], stamp
+      )
+      depth_message = build_depth_message(
+          Image, mros, depth, sequence, runtime["frame_id"], stamp
+      )
+      camera_info_message = build_camera_info_message(
+          CameraInfo,
+          mros,
+          K,
+          runtime["width"],
+          runtime["height"],
+          sequence,
+          runtime["frame_id"],
+          stamp,
+      )
+      color_publisher.publish(color_message)
+      depth_publisher.publish(depth_message)
+      camera_info_publisher.publish(camera_info_message)
+      sequence += 1
+      published_since_log += 1
+
+      now = time.monotonic()
+      elapsed = now - last_log_time
+      if runtime["log_interval_sec"] > 0.0 and elapsed >= runtime["log_interval_sec"]:
+        print(
+            f"[mROS RealSense] published={sequence}, rate={published_since_log / elapsed:.2f} FPS, "
+            f"subscribers=color:{color_publisher.getNumSubscribers()},"
+            f"depth:{depth_publisher.getNumSubscribers()},"
+            f"info:{camera_info_publisher.getNumSubscribers()}"
+        )
+        last_log_time = now
+        published_since_log = 0
+  finally:
+    camera.stop()
+    mros.shutdown()
+
+
+def print_runtime(runtime: dict, config_path: Path) -> None:
+  print(f"[mROS RealSense] config: {config_path}")
+  print(f"[mROS RealSense] node: {runtime['node_name']}")
+  print(f"[mROS RealSense] color: {runtime['color_topic']} (rgb8)")
+  print(f"[mROS RealSense] aligned depth: {runtime['depth_topic']} (32FC1 meters)")
+  print(f"[mROS RealSense] camera info: {runtime['camera_info_topic']}")
+  print(
+      f"[mROS RealSense] stream: {runtime['width']}x{runtime['height']}@{runtime['fps']}, "
+      f"frame={runtime['frame_id']}, CPU={runtime['cpu_cores']}"
+  )
 
 
 def main() -> int:
   args = parse_args()
   try:
     config_path = args.config.expanduser().resolve()
-    ros_setup = args.ros_setup.expanduser().resolve()
-    if not ros_setup.is_file():
-      raise RuntimeError(f"ROS 2 setup script does not exist: {ros_setup}")
-    command, topics, suppressed_topics = build_launch_command(load_config(config_path))
-  except (OSError, RuntimeError, yaml.YAMLError) as exc:
-    print(f"ERROR: {exc}", file=sys.stderr)
+    runtime = build_runtime_config(load_config(config_path))
+    print_runtime(runtime, config_path)
+    if args.dry_run:
+      return 0
+    run_publisher(runtime)
+  except KeyboardInterrupt:
+    print("[mROS RealSense] interrupted")
+  except (OSError, RuntimeError, ValueError, yaml.YAMLError) as exc:
+    print(f"ERROR: {exc}")
     return 2
-
-  print(f"[depth_color_publish] config: {config_path}")
-  print(f"[depth_color_publish] color: {topics['color_topic']}")
-  print(f"[depth_color_publish] aligned depth: {topics['depth_topic']}")
-  print(f"[depth_color_publish] camera info: {topics['camera_info_topic']}")
-  for source_topic, hidden_topic in suppressed_topics:
-    print(f"[depth_color_publish] suppressed: {source_topic} -> {hidden_topic}")
-  print(f"[depth_color_publish] command: {shlex.join(command)}", flush=True)
-  if args.dry_run:
-    return 0
-
-  shell_command = 'source "$1" && shift && exec "$@"'
-  os.execv(
-      "/bin/bash",
-      ["bash", "-c", shell_command, "depth_color_publish", str(ros_setup), *command],
-  )
   return 0
 
 

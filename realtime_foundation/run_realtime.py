@@ -606,20 +606,19 @@ def build_camera_reader(
         align_to_color=bool(camera_cfg.get("align_to_color", True)),
         reset_before_start=bool(camera_cfg.get("reset_before_start", True)),
     )
-  if source == "ros2":
+  if source == "mros":
     try:
-      from camera.ros2_rgbd_shm_reader import Ros2RgbdSharedMemoryReader
+      from camera.mros_rgbd_shm_reader import MrosRgbdSharedMemoryReader
     except ImportError as exc:
       raise RuntimeError(
-          "ROS 2 camera input requires the ROS-derived image and a sourced ROS environment. "
-          "Run with FoundationPose/docker/run_container_jetson_ros2.sh."
+          "mROS camera input requires the mROS Python package and its native runtime."
       ) from exc
-    return Ros2RgbdSharedMemoryReader.from_config(
+    return MrosRgbdSharedMemoryReader.from_config(
         config_path=Path(config_path),
         camera_config=camera_cfg,
-        ros2_config=camera_cfg.get("ros2", {}) or {},
+        mros_config=camera_cfg.get("mros", {}) or {},
     )
-  raise ValueError(f"Unsupported camera.source {source!r}; expected 'realsense' or 'ros2'")
+  raise ValueError(f"Unsupported camera.source {source!r}; expected 'realsense' or 'mros'")
 
 
 def resolve_tensorrt_backends(tracker_cfg: dict) -> dict:
@@ -1707,7 +1706,7 @@ def log_runtime(enabled: bool, message: str) -> None:
 def main() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument("--config", default=os.path.join(os.path.dirname(__file__), "config.yaml"))
-  parser.add_argument("--camera-source", choices=("realsense", "ros2"), default=None)
+  parser.add_argument("--camera-source", choices=("realsense", "mros"), default=None)
   args = parser.parse_args()
   cfg = load_config(args.config)
 

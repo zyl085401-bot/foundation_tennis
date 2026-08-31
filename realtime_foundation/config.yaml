@@ -1,5 +1,5 @@
 camera:
-  source: ros2   # realsense
+  source: mros   # realsense
   width: 640
   height: 480
   fps: 30
@@ -9,38 +9,28 @@ camera:
   align_to_color: true
   reset_before_start: true
 
-  ros2:
-    camera_namespace: ""
-    camera_name: camera
+  mros:
     color_topic: /camera/color/image_raw
     depth_topic: /camera/aligned_depth_to_color/image_raw
     camera_info_topic: /camera/color/camera_info
-    enable_color: true
-    enable_depth: true
-    align_depth: true
-    enable_sync: true
-    initial_reset: false
-    publish_tf: false  # FoundationPose直接使用固定外参做数值转换，不依赖RealSense TF。
-    # 曝光控制：优先使用 *_exposure_ms（毫秒）；*_exposure 保留为兼容旧配置的微秒值。
-    # 设定手动 exposure 或 gain 时，启动器会自动关闭对应流的自动曝光。
-    # 两种曝光单位不能同时设置；曝光/增益有效范围因相机型号而异。
+    publisher_node_name: foundationpose_rgbd_publisher
+    publisher_queue_size: 2
+    publisher_cpu_cores: [0, 1]
+    publisher_log_interval_sec: 1.0
+    frame_id: camera_color_optical_frame
     color_auto_exposure: true
-    color_exposure: null
     color_exposure_ms: null
     color_gain: null
     depth_auto_exposure: null
-    depth_exposure: null
     depth_exposure_ms: null
     depth_gain: null
-    # RealSense驱动没有逐话题关闭开关；将未使用发布器重映射到隐藏命名空间。
-    # 保留color/image_raw、aligned_depth_to_color/image_raw和color/camera_info。
-    suppress_unused_topics: true
     depth_scale: 0.001
     sync_queue_size: 10
     sync_slop_sec: 0.03
     frame_timeout_sec: 5.0
-    bridge_cpu_cores: [0, 1] #0 1 2
-    model_cpu_cores: [2, 3] # 3 4 5 6 7
+    reliable: false
+    bridge_cpu_cores: [0, 1]
+    model_cpu_cores: [2, 3]
     shared_slot_count: 3
     startup_timeout_sec: 10.0
     reader_node_name: foundationpose_rgbd_reader

@@ -18,7 +18,7 @@ except ImportError:
   from rgbd_shared_memory import LatestRgbdFrameBuffer
 
 
-class Ros2RgbdSharedMemoryReader:
+class MrosRgbdSharedMemoryReader:
   def __init__(
       self,
       config_path: Path,
@@ -37,17 +37,17 @@ class Ros2RgbdSharedMemoryReader:
     self.shared_slot_count = int(shared_slot_count)
     self.startup_timeout_sec = float(startup_timeout_sec)
     if self.width <= 0 or self.height <= 0:
-      raise ValueError("ROS2 shared-memory width and height must be positive")
+      raise ValueError("mROS shared-memory width and height must be positive")
     if self.startup_timeout_sec <= 0:
-      raise ValueError("ROS2 bridge startup_timeout_sec must be positive")
+      raise ValueError("mROS bridge startup_timeout_sec must be positive")
     if self.shared_slot_count < 2:
-      raise ValueError("ROS2 shared_slot_count must be at least 2")
+      raise ValueError("mROS shared_slot_count must be at least 2")
     overlap = set(self.bridge_cpu_cores) & set(self.model_cpu_cores)
     if overlap:
-      raise ValueError(f"ROS2 bridge and model CPU cores must be disjoint; overlap={sorted(overlap)}")
+      raise ValueError(f"mROS bridge and model CPU cores must be disjoint; overlap={sorted(overlap)}")
 
     self.available_cpu_cores = sorted(os.sched_getaffinity(0))
-    self.bridge_path = Path(__file__).with_name("ros2_rgbd_bridge.py").resolve()
+    self.bridge_path = Path(__file__).with_name("mros_rgbd_bridge.py").resolve()
     self.shared_name = f"foundationpose_rgbd_{os.getpid()}_{uuid.uuid4().hex}"
     self.shared_frame = None
     self.process = None
@@ -65,27 +65,27 @@ class Ros2RgbdSharedMemoryReader:
       cls,
       config_path: Path,
       camera_config: dict,
-      ros2_config: dict,
-  ) -> "Ros2RgbdSharedMemoryReader":
+      mros_config: dict,
+  ) -> "MrosRgbdSharedMemoryReader":
     return cls(
         config_path=config_path,
         width=int(camera_config.get("width", 640)),
         height=int(camera_config.get("height", 480)),
-        bridge_cpu_cores=ros2_config.get("bridge_cpu_cores", [0, 1, 2]),
-        model_cpu_cores=ros2_config.get("model_cpu_cores", [3, 4, 5, 6, 7]),
-        shared_slot_count=int(ros2_config.get("shared_slot_count", 3)),
-        startup_timeout_sec=float(ros2_config.get("startup_timeout_sec", 10.0)),
+        bridge_cpu_cores=mros_config.get("bridge_cpu_cores", [0, 1, 2]),
+        model_cpu_cores=mros_config.get("model_cpu_cores", [3, 4, 5, 6, 7]),
+        shared_slot_count=int(mros_config.get("shared_slot_count", 3)),
+        startup_timeout_sec=float(mros_config.get("startup_timeout_sec", 10.0)),
     )
 
   @staticmethod
   def _validate_cpu_cores(value, name: str) -> list[int]:
     if not isinstance(value, (list, tuple)) or not value:
-      raise ValueError(f"camera.ros2.{name} must be a non-empty list")
+      raise ValueError(f"camera.mros.{name} must be a non-empty list")
     cores = [int(core) for core in value]
     if any(core < 0 for core in cores):
-      raise ValueError(f"camera.ros2.{name} contains a negative core index: {cores}")
+      raise ValueError(f"camera.mros.{name} contains a negative core index: {cores}")
     if len(set(cores)) != len(cores):
-      raise ValueError(f"camera.ros2.{name} contains duplicate cores: {cores}")
+      raise ValueError(f"camera.mros.{name} contains duplicate cores: {cores}")
     return cores
 
   def apply_model_cpu_affinity(self) -> None:
@@ -107,10 +107,10 @@ class Ros2RgbdSharedMemoryReader:
     self.output_queue = queue.Queue()
     with self.output_lock:
       self.output_tail.clear()
-    self._validate_cores_available(self.bridge_cpu_cores, "ROS2 bridge")
+    self._validate_cores_available(self.bridge_cpu_cores, "mROS bridge")
     taskset_path = shutil.which("taskset")
     if taskset_path is None:
-      raise RuntimeError("taskset is required for ROS2 bridge CPU isolation")
+      raise RuntimeError("taskset is required for mROS bridge CPU isolation")
 
     self.shared_frame = LatestRgbdFrameBuffer.create(
         name=self.shared_name,
@@ -153,7 +153,7 @@ class Ros2RgbdSharedMemoryReader:
       )
       self.output_thread = threading.Thread(
           target=self._collect_output,
-          name="ros2-rgbd-bridge-output",
+          name="mros-rgbd-bridge-output",
           daemon=True,
       )
       self.output_thread.start()
@@ -211,11 +211,11 @@ class Ros2RgbdSharedMemoryReader:
       self.output_thread = None
       self.started = False
     if termination_error is not None:
-      print(f"[ROS2 SHM] Warning: bridge termination was incomplete: {termination_error}")
+      print(f"[mROS SHM] Warning: bridge termination was incomplete: {termination_error}")
 
   def get_frame(self, timeout_sec: float = 5.0):
     if not self.started or self.shared_frame is None:
-      raise RuntimeError("ROS2 shared-memory reader is not started")
+      raise RuntimeError("mROS shared-memory reader is not started")
     deadline = time.monotonic() + max(0.0, float(timeout_sec))
     while True:
       if self.stopping.is_set():
@@ -242,7 +242,7 @@ class Ros2RgbdSharedMemoryReader:
       remaining = deadline - time.monotonic()
       if remaining <= 0:
         raise TimeoutError(
-            f"ROS2 shared-memory bridge did not become ready within "
+            f"mROS shared-memory bridge did not become ready within "
             f"{self.startup_timeout_sec:.1f} seconds{self._formatted_output_tail()}"
         )
       try:
@@ -250,18 +250,18 @@ class Ros2RgbdSharedMemoryReader:
       except queue.Empty:
         continue
       if line.startswith("BRIDGE_READY "):
-        print(f"[ROS2 SHM] {line}")
+        print(f"[mROS SHM] {line}")
         return
       if line.startswith("BRIDGE_ERROR "):
-        raise RuntimeError(f"ROS2 shared-memory bridge failed: {line}{self._formatted_output_tail()}")
+        raise RuntimeError(f"mROS shared-memory bridge failed: {line}{self._formatted_output_tail()}")
 
   def _raise_if_bridge_failed(self) -> None:
     if self.process is None:
-      raise RuntimeError("ROS2 shared-memory bridge process was not created")
+      raise RuntimeError("mROS shared-memory bridge process was not created")
     return_code = self.process.poll()
     if return_code is not None:
       raise RuntimeError(
-          f"ROS2 shared-memory bridge exited with code {return_code}"
+          f"mROS shared-memory bridge exited with code {return_code}"
           f"{self._formatted_output_tail()}"
       )
 
@@ -276,22 +276,22 @@ class Ros2RgbdSharedMemoryReader:
           self.output_tail.append(line)
         self.output_queue.put(line)
         if not line.startswith("BRIDGE_READY "):
-          print(f"[ROS2 SHM BRIDGE] {line}")
+          print(f"[mROS SHM BRIDGE] {line}")
     except (OSError, ValueError):
       if not self.stopping.is_set():
         raise
 
   def _formatted_output_tail(self) -> str:
     with self.output_lock:
-      output_tail = list(self.output_tail)
-    if not output_tail:
+      lines = list(self.output_tail)
+    if not lines:
       return ""
-    return "\nBridge output:\n" + "\n".join(output_tail)
+    return "\nBridge output:\n" + "\n".join(lines)
 
   def _validate_cores_available(self, cores: list[int], role: str) -> None:
     unavailable = sorted(set(cores) - set(self.available_cpu_cores))
     if unavailable:
-      raise RuntimeError(
-          f"Requested {role} CPU cores are unavailable: {unavailable}; "
-          f"startup allowed cores={self.available_cpu_cores}"
+      raise ValueError(
+          f"Configured {role} CPU cores {unavailable} are unavailable; "
+          f"allowed cores={self.available_cpu_cores}"
       )

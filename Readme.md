@@ -24,12 +24,20 @@ bash FoundationPose/docker/run_container_jetson_ros2.sh \
   python3 realtime_foundation/run_realtime.py \
   --config realtime_foundation/config.yaml
 
-# 打开相机
-python3 realtime_foundation/camera/depth_color_publish 
+# 启动RealSense并通过mROS发布彩色、对齐深度和相机内参话题
+python3 realtime_foundation/camera/depth_color_publish \
+  --config realtime_foundation/config.yaml
 
-# 调节曝光：在 realtime_foundation/config.yaml 的 camera.ros2 中设置
-# color_exposure_ms（单位毫秒，及可选 color_gain）。设置手动值会自动关闭彩色流自动曝光。
-# 例如：color_exposure_ms: 8.5。旧的 color_exposure 单位为微秒，兼容保留；两者不能同时设置。
+# 相机分辨率、帧率、序列号、mROS话题和曝光参数统一在config.yaml的camera/camera.mros中设置。
+
+# 在联网的x86_64开发机准备Jetson Python 3.10/aarch64的mROS离线依赖。
+bash FoundationPose/docker/prepare_jetson_mros_offline.sh
+
+# 将仓库同步到NX后，离线构建包含mROS的基础镜像。
+bash FoundationPose/docker/build_jetson.sh
+
+# 进入NX容器后验证mROS和RealSense导入。
+python3 -c 'import mros, pyrealsense2; print(mros.__file__)'
 
 # Jetson 性能关联采集：同时记录运行日志、50 ms GPU 状态、200 ms
 # GPU/EMC/温度/功耗和 tegrastats。Ctrl+C 后自动生成 events.csv、

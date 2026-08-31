@@ -41,6 +41,7 @@ fi
 REQUIRED_OFFLINE_FILES=(
   "${OFFLINE_DIR}/src/pytorch3d.tar.gz"
   "${OFFLINE_DIR}/src/nvdiffrast.tar.gz"
+  "${SCRIPT_DIR}/requirements.jetson.mros.txt"
   "${OFFLINE_DIR}/yolo26/ultralytics-8.4.66-py3-none-any.whl"
   "${OFFLINE_DIR}/yolo26/ultralytics_thop-2.0.20-py3-none-any.whl"
   "${OFFLINE_DIR}/yolo26/nvidia_ml_py-13.610.43-py3-none-any.whl"
@@ -67,6 +68,26 @@ if ! compgen -G "${OFFLINE_DIR}/wheels/open3d-0.18.0-cp310-cp310-*_aarch64.whl" 
   echo "ERROR: Python 3.10 ARM64 Open3D wheel is missing: ${OFFLINE_DIR}/wheels" >&2
   exit 1
 fi
+if [[ ! -s "${OFFLINE_DIR}/mros/SHA256SUMS" ]]; then
+  echo "ERROR: mROS offline bundle is missing: ${OFFLINE_DIR}/mros" >&2
+  echo "Run FoundationPose/docker/prepare_jetson_mros_offline.sh on the x86_64 development PC." >&2
+  exit 1
+fi
+(
+  cd "${OFFLINE_DIR}/mros"
+  sha256sum --check --quiet SHA256SUMS
+)
+for pattern in \
+  'mros-2.3.1-py3-none-any.whl' \
+  'python_gnupg-*.whl' \
+  'lz4-*aarch64.whl' \
+  'pycryptodomex-*aarch64.whl'; do
+  matches=("${OFFLINE_DIR}"/mros/${pattern})
+  if (( ${#matches[@]} != 1 )) || [[ ! -s "${matches[0]}" ]]; then
+    echo "ERROR: Expected one mROS offline wheel matching ${pattern}." >&2
+    exit 1
+  fi
+done
 
 REQUIRED_WHEELS=(
   addict-2.4.0-py3-none-any.whl
@@ -146,6 +167,7 @@ tar --create --file - --directory "${REPO_ROOT}" \
   FoundationPose/docker/Dockerfile.jetson \
   FoundationPose/docker/requirements.jetson.txt \
   FoundationPose/docker/requirements.jetson.sdist.txt \
+  FoundationPose/docker/requirements.jetson.mros.txt \
   FoundationPose/docker/requirements.jetson.yolo26.txt \
   FoundationPose/docker/requirements.jetson.gui.txt \
   FoundationPose/docker/jetson_offline_jp61 \

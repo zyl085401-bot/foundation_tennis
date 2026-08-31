@@ -59,7 +59,9 @@ RUN set -eu; \
 
 COPY FoundationPose/docker/requirements.jetson.txt /opt/offline/requirements.jetson.txt
 COPY FoundationPose/docker/requirements.jetson.sdist.txt /opt/offline/requirements.jetson.sdist.txt
+COPY FoundationPose/docker/requirements.jetson.mros.txt /opt/offline/requirements.jetson.mros.txt
 COPY FoundationPose/docker/jetson_offline_jp61/wheels/ /opt/offline/wheels/
+COPY FoundationPose/docker/jetson_offline_jp61/mros/ /opt/offline/mros/
 
 # --no-deps is intentional: the pinned files list the complete missing runtime
 # set, while the validated NVIDIA base packages must remain untouched.
@@ -71,6 +73,16 @@ RUN python3 -m pip install \
       -r /opt/offline/requirements.jetson.txt \
             -r /opt/offline/requirements.jetson.sdist.txt \
         && python3 -c 'import cv2, numpy, scipy, sys, torch, torchvision; assert sys.version_info[:2] == (3, 10), sys.version; print("Validated NVIDIA base packages were preserved"); print("torch/torchvision:", torch.__version__, torchvision.__version__); print("numpy/scipy/cv2:", numpy.__version__, scipy.__version__, cv2.__version__)'
+
+# mROS is supplied as an ARM64 wheel. Install only the communication runtime's
+# import-time dependencies; optional mros.flow/OpenAI packages are not needed.
+RUN python3 -m pip install \
+            --no-index \
+            --find-links=/opt/offline/mros \
+            --no-deps \
+            -r /opt/offline/requirements.jetson.mros.txt \
+            /opt/offline/mros/mros-2.3.1-py3-none-any.whl \
+        && python3 -c 'import mros; from mros.geometry_msgs.msg import PoseStamped; from mros.sensor_msgs.msg import CameraInfo, Image; from mros.std_msgs.msg import Float32MultiArray, String; print("mROS:", mros.__file__)'
 
 # The validated Open3D Python 3.10 ARM64 wheel is supplied offline. Its exact
 # Python dependencies are already installed from requirements.jetson.txt.
