@@ -10,9 +10,10 @@ camera:
   reset_before_start: true
 
   mros:
-    color_topic: /camera/color/image_raw
-    depth_topic: /camera/aligned_depth_to_color/image_raw
-    camera_info_topic: /camera/color/camera_info
+    # sensormanager发布原始、未对齐的RGB-D；接收端按下方静态标定完成Depth->Color对齐。
+    color_topic: /tron2/color
+    depth_topic: /tron2/depth
+    camera_info_topic: null
     publisher_node_name: foundationpose_rgbd_publisher
     publisher_queue_size: 2
     publisher_cpu_cores: [0, 1]
@@ -22,7 +23,7 @@ camera:
     color_exposure_ms: 50  # 手动曝光时必须填写正数，单位ms；自动曝光时忽略。
     depth_scale: 0.001
     sync_queue_size: 10
-    sync_slop_sec: 0.03
+    sync_slop_sec: 0.01
     frame_timeout_sec: 5.0
     # 首帧由startup_timeout_sec保护；开始出流后连续无同步帧达到此时长则报错退出。
     disconnect_timeout_sec: 3.0
@@ -32,6 +33,57 @@ camera:
     shared_slot_count: 3
     startup_timeout_sec: 10.0
     reader_node_name: foundationpose_rgbd_reader
+
+    depth_to_color_alignment:
+      # 生产环境必须开启；关闭时原始Depth仅用于A/B调试，与Color/K的几何关系无效。
+      enabled: true
+      backend: opencv_rgbd
+      depth_dilation: false
+
+      # 标定来源信息仅供人工审计，mROS Image消息无法验证远端相机序列号。
+      camera_model: Intel RealSense D435I
+      serial: "233722070521"
+      firmware: "5.13.0.55"
+      exported_at: "2026-09-01T18:13:46+08:00"
+      calibration_width: 640
+      calibration_height: 480
+      calibration_fps: 30
+
+      validation:
+        require_zero_distortion: true
+        require_resolution_match: true
+
+      diagnostics:
+        enabled: true
+        log_interval_sec: 5.0
+        expected_fps: 30.0
+        fps_tolerance: 2.0
+
+      depth:
+        K:
+          - [389.875305175781, 0.0, 320.413757324219]
+          - [0.0, 389.875305175781, 236.457885742188]
+          - [0.0, 0.0, 1.0]
+        distortion_model: brown_conrady
+        distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+      color:
+        K:
+          - [607.86669921875, 0.0, 324.967041015625]
+          - [0.0, 607.938354492188, 247.910064697266]
+          - [0.0, 0.0, 1.0]
+        distortion_model: inverse_brown_conrady
+        distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+      depth_to_color:
+        rotation:
+          - [0.999917, 0.0117287, 0.00531798]
+          - [-0.0117292, 0.999931, 0.000057999]
+          - [-0.00531694, -0.00012037, 0.999986]
+        translation_m:
+          - 0.0147585337981582
+          - -0.00018205500964541
+          - -0.0000490047350467648
 
 # FoundationPose 的 mROS 标准消息输出。PoseStamped 表示物体坐标系在彩色相机
 # optical frame 下的位姿；状态只在发生变化时发布。
