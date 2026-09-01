@@ -35,9 +35,9 @@ camera:
     startup_timeout_sec: 10.0
     reader_node_name: foundationpose_rgbd_reader
 
-# FoundationPose 姿态的 ROS2 标准消息输出。PoseStamped 表示物体坐标系在彩色相机
-# optical frame 下的位姿；状态只在发生变化时发布，并为后启动的订阅者保留最新值。
-pose_ros2:
+# FoundationPose 的 mROS 标准消息输出。PoseStamped 表示物体坐标系在彩色相机
+# optical frame 下的位姿；状态只在发生变化时发布。
+pose_mros:
   enabled: true
   node_name: foundationpose_pose_publisher
   pose_topic: /foundationpose/object_pose
@@ -46,20 +46,17 @@ pose_ros2:
   child_frame_id: detected_object
   publish_status: true
   publish_tf: false
-  qos:
-    reliability: reliable
-    depth: 1
-  # RViz2调试画面；发布内容与realtime窗口使用同一张RGB图像。
+  queue_size: 1
+  status_queue_size: 1
+  # mROS调试画面；发布内容与realtime窗口使用同一张RGB图像。
   # enabled=false时不创建图像Publisher，也不会为该功能生成叠加图。
   visualization:
     enabled: true
     topic: /foundationpose/visualization
     frame_id: camera_color_optical_frame
     publish_rate_hz: 0.0  # 0：不限制，跟随原窗口的更新节奏；正数：限制最大发布频率。
-    only_with_subscribers: true  # RViz2未订阅时跳过叠加图生成和消息构造。
-    qos:
-      reliability: best_effort
-      depth: 1
+    only_with_subscribers: true  # 没有mROS订阅者时跳过叠加图生成和消息构造。
+    queue_size: 1
   # 控制端目标流：直接计算 base_from_camera @ camera_pose 并发布base_Link下的结果。
   # 固定外参对应上方相机的camera_color_optical_frame；不修改URDF，也不发布相机TF。
   # 每次成功Register更新目标；后台以固定频率重复最新结果，超时后暂停而不发送旧值。
@@ -72,23 +69,19 @@ pose_ros2:
     publish_static_tf: false
     publish_rate_hz: 20.0
     stale_timeout_sec: 1.0
+    queue_size: 1
     base_from_camera:
       - [0.0, -0.6427661390, 0.766062459, 0.22117]
       - [-1.0, 0.0, 0.0, 0.0175]
       - [0.0, -0.7660624590, -0.6427661390, 0.18592]
       - [0.0, 0.0, 0.0, 1.0]
 
-#      - [0.0, -0.766062459, -0.642766139, 0.22117]
-#      - [-1.0, 0.0, 0.0, 0.0175]
-#      - [0.0, 0.642766139, -0.766062459, 0.18592]
-#      - [0.0, 0.0, 0.0, 1.0]
-
 yolo:
   precision: int8             # int8|fp16；当前使用 tennis INT8 engine。
   io_precision: int8          # int8|fp32；INT8输入启用GPU整数预处理，失败时回退FP32输入INT8网络。
-  int8_io_weights: realtime_foundation/yolo_weights/tennis1_best_480x640_int8_io_trt104.engine
-  int8_weights: realtime_foundation/yolo_weights/tennis1_best_480x640_int8_trt104.engine
-  weights: realtime_foundation/yolo_weights/tennis1_best_480x640_trt104.engine
+  int8_io_weights: realtime_foundation/yolo_weights1/tennis_best_480x640_int8_io_trt104.engine
+  int8_weights: realtime_foundation/yolo_weights1/tennis_best_480x640_int8_trt104.engine
+  weights: realtime_foundation/yolo_weights1/tennis_best_480x640_trt104.engine
   fallback_to_fp32_io: true
   fallback_to_fp16: true
   int8_input_dynamic_range: 1.0  # normalized RGB [0,1]；必须与INT8 I/O Engine构建参数一致。

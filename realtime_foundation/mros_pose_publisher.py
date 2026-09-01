@@ -11,23 +11,17 @@ import numpy as np
 FOUNDATIONPOSE_STATUS_STATES = frozenset(("SEARCHING", "TRACKING", "LOST"))
 
 
-class Ros2PosePublisher:
-  """Publish poses, optional RViz images, and the latest base-frame WheelArm target."""
+class MrosPosePublisher:
+  """Publish FoundationPose outputs with mROS standard messages."""
 
   def __init__(self, config: Mapping | None = None):
     config = {} if config is None else config
-    qos_config = config.get("qos", {})
-    if not isinstance(qos_config, Mapping):
-      raise ValueError("pose_ros2.qos must be a mapping")
     visualization_config = config.get("visualization", {})
     if not isinstance(visualization_config, Mapping):
-      raise ValueError("pose_ros2.visualization must be a mapping")
-    visualization_qos_config = visualization_config.get("qos", {})
-    if not isinstance(visualization_qos_config, Mapping):
-      raise ValueError("pose_ros2.visualization.qos must be a mapping")
+      raise ValueError("pose_mros.visualization must be a mapping")
     wheelarm_config = config.get("wheelarm_target", {})
     if not isinstance(wheelarm_config, Mapping):
-      raise ValueError("pose_ros2.wheelarm_target must be a mapping")
+      raise ValueError("pose_mros.wheelarm_target must be a mapping")
 
     self.enabled = bool(config.get("enabled", False))
     self.node_name = str(config.get("node_name", "foundationpose_pose_publisher"))
@@ -37,31 +31,36 @@ class Ros2PosePublisher:
     self.child_frame_id = str(config.get("child_frame_id", "detected_object"))
     self.publish_tf = bool(config.get("publish_tf", False))
     self.publish_status_enabled = bool(config.get("publish_status", True))
-    self.reliability = str(qos_config.get("reliability", "reliable")).lower()
-    self.pose_depth = max(1, int(qos_config.get("depth", 1)))
+    self.pose_queue_size = _positive_queue_size(config.get("queue_size", 1), "queue_size")
+    self.status_queue_size = _positive_queue_size(
+        config.get("status_queue_size", 1),
+        "status_queue_size",
+    )
+
     self.visualization_enabled = self.enabled and bool(
-      visualization_config.get("enabled", False)
+        visualization_config.get("enabled", False)
     )
     self.visualization_topic = str(
-      visualization_config.get("topic", "/foundationpose/visualization")
+        visualization_config.get("topic", "/foundationpose/visualization")
     )
     self.visualization_frame_id = str(
-      visualization_config.get("frame_id", self.frame_id)
+        visualization_config.get("frame_id", self.frame_id)
     )
     self.visualization_publish_rate_hz = float(
-      visualization_config.get("publish_rate_hz", 0.0)
+        visualization_config.get("publish_rate_hz", 0.0)
     )
     self.visualization_only_with_subscribers = bool(
-      visualization_config.get("only_with_subscribers", True)
+        visualization_config.get("only_with_subscribers", True)
     )
-    self.visualization_reliability = str(
-      visualization_qos_config.get("reliability", "best_effort")
-    ).lower()
-    self.visualization_depth = max(1, int(visualization_qos_config.get("depth", 1)))
+    self.visualization_queue_size = _positive_queue_size(
+        visualization_config.get("queue_size", 1),
+        "visualization.queue_size",
+    )
+
     self.wheelarm_enabled = bool(wheelarm_config.get("enabled", False))
     self.wheelarm_topic = str(wheelarm_config.get("topic", "/wheelarm/target"))
     self.wheelarm_base_pose_topic = str(
-      wheelarm_config.get("base_pose_topic", "/foundationpose/object_pose_base")
+        wheelarm_config.get("base_pose_topic", "/foundationpose/object_pose_base")
     )
     self.wheelarm_source_frame = str(
         wheelarm_config.get("source_frame", "camera_color_optical_frame")
@@ -70,31 +69,29 @@ class Ros2PosePublisher:
     self.wheelarm_publish_static_tf = bool(wheelarm_config.get("publish_static_tf", False))
     self.wheelarm_publish_rate_hz = float(wheelarm_config.get("publish_rate_hz", 20.0))
     self.wheelarm_stale_timeout_sec = float(wheelarm_config.get("stale_timeout_sec", 1.0))
+    self.wheelarm_queue_size = _positive_queue_size(
+        wheelarm_config.get("queue_size", 1),
+        "wheelarm_target.queue_size",
+    )
     base_from_camera = wheelarm_config.get("base_from_camera", np.eye(4))
     self.wheelarm_base_from_camera = _validate_pose_matrix(base_from_camera).copy()
 
-    if self.reliability not in ("reliable", "best_effort"):
-      raise ValueError("pose_ros2.qos.reliability must be 'reliable' or 'best_effort'")
-    if self.visualization_reliability not in ("reliable", "best_effort"):
-      raise ValueError(
-          "pose_ros2.visualization.qos.reliability must be 'reliable' or 'best_effort'"
-      )
     if self.visualization_publish_rate_hz < 0.0 or not math.isfinite(
         self.visualization_publish_rate_hz
     ):
       raise ValueError(
-          "pose_ros2.visualization.publish_rate_hz must be zero or positive and finite"
+          "pose_mros.visualization.publish_rate_hz must be zero or positive and finite"
       )
     if self.wheelarm_publish_rate_hz <= 0.0 or not math.isfinite(self.wheelarm_publish_rate_hz):
-      raise ValueError("pose_ros2.wheelarm_target.publish_rate_hz must be positive and finite")
+      raise ValueError("pose_mros.wheelarm_target.publish_rate_hz must be positive and finite")
     if self.wheelarm_stale_timeout_sec <= 0.0 or not math.isfinite(self.wheelarm_stale_timeout_sec):
-      raise ValueError("pose_ros2.wheelarm_target.stale_timeout_sec must be positive and finite")
+      raise ValueError("pose_mros.wheelarm_target.stale_timeout_sec must be positive and finite")
     if (
         self.wheelarm_enabled
         and self.wheelarm_publish_static_tf
         and self.wheelarm_source_frame == self.wheelarm_target_frame
     ):
-      raise ValueError("pose_ros2.wheelarm_target source_frame and target_frame must differ")
+      raise ValueError("pose_mros.wheelarm_target source_frame and target_frame must differ")
     for name, value in (
         ("node_name", self.node_name),
         ("pose_topic", self.pose_topic),
@@ -109,10 +106,10 @@ class Ros2PosePublisher:
         ("wheelarm_target.target_frame", self.wheelarm_target_frame),
     ):
       if not value:
-        raise ValueError(f"pose_ros2.{name} must not be empty")
-    self._rclpy = None
-    self._context = None
-    self._node = None
+        raise ValueError(f"pose_mros.{name} must not be empty")
+
+    self._mros = None
+    self._started = False
     self._pose_publisher = None
     self._status_publisher = None
     self._visualization_publisher = None
@@ -134,113 +131,86 @@ class Ros2PosePublisher:
     self._latest_wheelarm_quaternion_xyzw = None
     self._wheelarm_stale_reported = False
     self._last_visualization_publish_monotonic = None
+    self._pose_sequence = 0
+    self._visualization_sequence = 0
+    self._wheelarm_base_pose_sequence = 0
 
   def start(self) -> None:
     if not self.enabled:
       return
-    if self._node is not None:
-      raise RuntimeError("Ros2PosePublisher.start() was called more than once")
+    if self._started:
+      raise RuntimeError("MrosPosePublisher.start() was called more than once")
 
     try:
-      import rclpy
-      from geometry_msgs.msg import PoseStamped, TransformStamped
-      from rclpy.context import Context
-      from rclpy.node import Node
-      from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-      from std_msgs.msg import Float32MultiArray, String
+      import mros
+      from mros.geometry_msgs.msg import PoseStamped, TransformStamped
+      from mros.std_msgs.msg import Float32MultiArray, String
       if self.visualization_enabled:
-        from sensor_msgs.msg import Image
+        from mros.sensor_msgs.msg import Image
       else:
         Image = None
       if self.publish_tf:
-        from tf2_ros import TransformBroadcaster
+        from mros.tf import TransformBroadcaster
       else:
         TransformBroadcaster = None
       if self.wheelarm_enabled and self.wheelarm_publish_static_tf:
-        from tf2_ros import StaticTransformBroadcaster
+        from mros.tf import StaticTransformBroadcaster
       else:
         StaticTransformBroadcaster = None
     except ImportError as exc:
       raise RuntimeError(
-          "ROS 2 pose publishing is enabled, but the ROS 2 Python dependencies are unavailable. "
-          "Run inside the ROS 2 container or set pose_ros2.enabled=false."
+          "mROS pose publishing is enabled, but the mROS Python package is unavailable. "
+          "Run inside the FoundationPose Jetson container or set pose_mros.enabled=false."
       ) from exc
 
-    reliability = (
-        ReliabilityPolicy.RELIABLE
-        if self.reliability == "reliable"
-        else ReliabilityPolicy.BEST_EFFORT
-    )
-    pose_qos = QoSProfile(
-        history=HistoryPolicy.KEEP_LAST,
-        depth=self.pose_depth,
-        reliability=reliability,
-        durability=DurabilityPolicy.VOLATILE,
-    )
-    status_qos = QoSProfile(
-        history=HistoryPolicy.KEEP_LAST,
-        depth=1,
-        reliability=ReliabilityPolicy.RELIABLE,
-        durability=DurabilityPolicy.TRANSIENT_LOCAL,
-    )
-
-    context = Context()
-    rclpy.init(args=None, context=context)
+    mros.init(self.node_name)
     try:
-      node = Node(self.node_name, context=context)
-      pose_publisher = node.create_publisher(PoseStamped, self.pose_topic, pose_qos)
+      pose_publisher = mros.advertise(
+          self.pose_topic,
+          PoseStamped,
+          False,
+          self.pose_queue_size,
+      )
       status_publisher = None
       if self.publish_status_enabled:
-        status_publisher = node.create_publisher(String, self.status_topic, status_qos)
+        status_publisher = mros.advertise(
+            self.status_topic,
+            String,
+            False,
+            self.status_queue_size,
+        )
       visualization_publisher = None
       if self.visualization_enabled:
-        visualization_reliability = (
-            ReliabilityPolicy.RELIABLE
-            if self.visualization_reliability == "reliable"
-            else ReliabilityPolicy.BEST_EFFORT
-        )
-        visualization_publisher = node.create_publisher(
-            Image,
+        visualization_publisher = mros.advertise(
             self.visualization_topic,
-            QoSProfile(
-                history=HistoryPolicy.KEEP_LAST,
-                depth=self.visualization_depth,
-                reliability=visualization_reliability,
-                durability=DurabilityPolicy.VOLATILE,
-            ),
+            Image,
+            False,
+            self.visualization_queue_size,
         )
       wheelarm_publisher = None
       wheelarm_base_pose_publisher = None
       if self.wheelarm_enabled:
-        wheelarm_publisher = node.create_publisher(
-            Float32MultiArray,
+        wheelarm_publisher = mros.advertise(
             self.wheelarm_topic,
-            QoSProfile(
-                history=HistoryPolicy.KEEP_LAST,
-                depth=1,
-                reliability=ReliabilityPolicy.RELIABLE,
-                durability=DurabilityPolicy.VOLATILE,
-            ),
+            Float32MultiArray,
+            False,
+            self.wheelarm_queue_size,
         )
-        wheelarm_base_pose_publisher = node.create_publisher(
-            PoseStamped,
+        wheelarm_base_pose_publisher = mros.advertise(
             self.wheelarm_base_pose_topic,
-            pose_qos,
+            PoseStamped,
+            False,
+            self.pose_queue_size,
         )
-      tf_broadcaster = None
-      if TransformBroadcaster is not None:
-        tf_broadcaster = TransformBroadcaster(node)
-      wheelarm_static_tf_broadcaster = None
-      if StaticTransformBroadcaster is not None:
-        wheelarm_static_tf_broadcaster = StaticTransformBroadcaster(node)
+      tf_broadcaster = TransformBroadcaster() if TransformBroadcaster is not None else None
+      wheelarm_static_tf_broadcaster = (
+          StaticTransformBroadcaster() if StaticTransformBroadcaster is not None else None
+      )
     except Exception:
-      if context.ok():
-        rclpy.shutdown(context=context)
+      mros.shutdown()
       raise
 
-    self._rclpy = rclpy
-    self._context = context
-    self._node = node
+    self._mros = mros
     self._pose_publisher = pose_publisher
     self._status_publisher = status_publisher
     self._visualization_publisher = visualization_publisher
@@ -253,24 +223,25 @@ class Ros2PosePublisher:
     self._Float32MultiArray = Float32MultiArray
     self._wheelarm_publisher = wheelarm_publisher
     self._wheelarm_base_pose_publisher = wheelarm_base_pose_publisher
+    self._started = True
 
-    print("[ROS2 Pose] Publisher started")
-    print(f"  pose: {self.pose_topic} ({self.reliability}, depth={self.pose_depth})")
+    print("[mROS Pose] Publisher started")
+    print(f"  node: {self.node_name}")
+    print(f"  pose: {self.pose_topic} (queue={self.pose_queue_size})")
     if self.publish_status_enabled:
-      print(f"  status: {self.status_topic} (reliable, transient_local, depth=1)")
+      print(f"  status: {self.status_topic} (queue={self.status_queue_size})")
     if self.visualization_enabled:
       rate_text = (
-        "window cadence"
-        if self.visualization_publish_rate_hz == 0.0
-        else f"max {self.visualization_publish_rate_hz:g} Hz"
+          "window cadence"
+          if self.visualization_publish_rate_hz == 0.0
+          else f"max {self.visualization_publish_rate_hz:g} Hz"
       )
       subscriber_text = (
-        ", subscribers only" if self.visualization_only_with_subscribers else ""
+          ", subscribers only" if self.visualization_only_with_subscribers else ""
       )
       print(
-        f"  visualization: {self.visualization_topic} (rgb8, "
-        f"{self.visualization_reliability}, depth={self.visualization_depth}, "
-        f"{rate_text}{subscriber_text})"
+          f"  visualization: {self.visualization_topic} (rgb8, "
+          f"queue={self.visualization_queue_size}, {rate_text}{subscriber_text})"
       )
     if self.publish_tf:
       print(f"  TF: {self.frame_id} -> {self.child_frame_id}")
@@ -280,12 +251,13 @@ class Ros2PosePublisher:
           f"({self.wheelarm_source_frame} -> {self.wheelarm_target_frame}, "
           f"stale={self.wheelarm_stale_timeout_sec:g}s)"
       )
-      print(f"  wheelarm RViz pose: {self.wheelarm_base_pose_topic} ({self.wheelarm_target_frame})")
+      print(
+          f"  wheelarm base pose: {self.wheelarm_base_pose_topic} "
+          f"({self.wheelarm_target_frame})"
+      )
       if self.wheelarm_publish_static_tf:
         self._publish_wheelarm_static_transform()
-        print(
-            f"  static TF: {self.wheelarm_target_frame} -> {self.wheelarm_source_frame}"
-        )
+        print(f"  static TF: {self.wheelarm_target_frame} -> {self.wheelarm_source_frame}")
       self._wheelarm_stop_event.clear()
       self._wheelarm_thread = threading.Thread(
           target=self._wheelarm_publish_loop,
@@ -307,6 +279,7 @@ class Ros2PosePublisher:
       raise ValueError("Pose frame_id must not be empty")
 
     message = self._PoseStamped()
+    message.header.seq = self._take_sequence("_pose_sequence")
     message.header.stamp = stamp_message
     message.header.frame_id = parent_frame
     message.pose.position.x = float(matrix[0, 3])
@@ -330,14 +303,14 @@ class Ros2PosePublisher:
       transform.transform.rotation.y = qy
       transform.transform.rotation.z = qz
       transform.transform.rotation.w = qw
-      self._tf_broadcaster.sendTransform(transform)
+      self._tf_broadcaster.sendTransform([transform])
 
   def visualization_due(self) -> bool:
-    """Return whether the realtime-window image should be built for RViz now."""
+    """Return whether the realtime-window image should be built for mROS now."""
     publisher = self._visualization_publisher
     if not self.visualization_enabled or publisher is None:
       return False
-    if self.visualization_only_with_subscribers and publisher.get_subscription_count() <= 0:
+    if self.visualization_only_with_subscribers and publisher.getNumSubscribers() <= 0:
       return False
     if self.visualization_publish_rate_hz == 0.0:
       return True
@@ -363,19 +336,8 @@ class Ros2PosePublisher:
     image = np.ascontiguousarray(image)
 
     message = self._Image()
-    if timestamp_seconds is None:
-      message.header.stamp = self._node.get_clock().now().to_msg()
-    else:
-      timestamp = float(timestamp_seconds)
-      if timestamp < 0.0 or not math.isfinite(timestamp):
-        raise ValueError("Visualization timestamp must be non-negative and finite")
-      seconds = math.floor(timestamp)
-      nanoseconds = int(round((timestamp - seconds) * 1_000_000_000.0))
-      if nanoseconds >= 1_000_000_000:
-        seconds += 1
-        nanoseconds -= 1_000_000_000
-      message.header.stamp.sec = int(seconds)
-      message.header.stamp.nanosec = nanoseconds
+    message.header.seq = self._take_sequence("_visualization_sequence")
+    message.header.stamp = self._resolve_stamp(timestamp_seconds)
     message.header.frame_id = self.visualization_frame_id
     message.height = int(image.shape[0])
     message.width = int(image.shape[1])
@@ -406,10 +368,10 @@ class Ros2PosePublisher:
     transform.transform.rotation.y = qy
     transform.transform.rotation.z = qz
     transform.transform.rotation.w = qw
-    broadcaster.sendTransform(transform)
+    broadcaster.sendTransform([transform])
 
   def update_wheelarm_target(self, camera_pose: np.ndarray, stamp=None) -> list[float] | None:
-    """Replace the target continuously published on /wheelarm/target."""
+    """Replace the target continuously published on the configured mROS topic."""
     if not self.enabled or not self.wheelarm_enabled:
       return None
     self._require_started()
@@ -439,6 +401,7 @@ class Ros2PosePublisher:
       raise ValueError("WheelArm target contains NaN or Inf")
     _, _, _, qw, qx, qy, qz = (float(value) for value in data)
     message = message_type()
+    message.header.seq = self._take_sequence("_wheelarm_base_pose_sequence")
     message.header.stamp = self._resolve_stamp(stamp)
     message.header.frame_id = self.wheelarm_target_frame
     message.pose.position.x = float(matrix[0, 3])
@@ -513,7 +476,7 @@ class Ros2PosePublisher:
     self._last_status = normalized
 
   def stop(self) -> None:
-    if not self.enabled or self._node is None:
+    if not self.enabled or not self._started:
       return
     self._wheelarm_stop_event.set()
     wheelarm_thread = self._wheelarm_thread
@@ -521,34 +484,60 @@ class Ros2PosePublisher:
     if wheelarm_thread is not None and wheelarm_thread.is_alive():
       wheelarm_thread.join(timeout=2.0)
     self.clear_wheelarm_target()
-    node = self._node
-    context = self._context
-    rclpy = self._rclpy
-    self._node = None
+
+    mros = self._mros
+    self._started = False
+    self._pose_publisher = None
+    self._status_publisher = None
     self._visualization_publisher = None
-    self._last_visualization_publish_monotonic = None
+    self._tf_broadcaster = None
     self._wheelarm_static_tf_broadcaster = None
-    try:
-      node.destroy_node()
-    finally:
-      if context is not None and context.ok():
-        rclpy.shutdown(context=context)
+    self._wheelarm_publisher = None
+    self._wheelarm_base_pose_publisher = None
+    self._last_visualization_publish_monotonic = None
+    self._mros = None
+    if mros is not None:
+      mros.shutdown()
 
   def _resolve_stamp(self, stamp):
     if stamp is None:
-      return self._node.get_clock().now().to_msg()
-    if hasattr(stamp, "to_msg"):
-      return stamp.to_msg()
-    if hasattr(stamp, "sec") and hasattr(stamp, "nanosec"):
+      return self._mros.Time.now()
+    if isinstance(stamp, (int, float, np.integer, np.floating)):
+      timestamp = float(stamp)
+      if timestamp < 0.0 or not math.isfinite(timestamp):
+        raise ValueError("mROS timestamp must be non-negative and finite")
+      seconds = math.floor(timestamp)
+      nanoseconds = int(round((timestamp - seconds) * 1_000_000_000.0))
+      if nanoseconds >= 1_000_000_000:
+        seconds += 1
+        nanoseconds -= 1_000_000_000
+      return self._mros.Time(int(seconds), nanoseconds)
+    if hasattr(stamp, "sec") and hasattr(stamp, "nsec"):
       return stamp
-    raise TypeError(
-        "stamp must be builtin_interfaces.msg.Time, rclpy.time.Time, or None; "
-        "floating-point timestamps are intentionally unsupported"
-    )
+    if hasattr(stamp, "sec") and hasattr(stamp, "nanosec"):
+      return self._mros.Time(int(stamp.sec), int(stamp.nanosec))
+    raise TypeError("stamp must be mros.Time, a non-negative numeric timestamp, or None")
+
+  def _take_sequence(self, attribute: str) -> int:
+    sequence = int(getattr(self, attribute))
+    setattr(self, attribute, (sequence + 1) & 0xFFFFFFFF)
+    return sequence
 
   def _require_started(self) -> None:
-    if self._node is None:
-      raise RuntimeError("Ros2PosePublisher.start() must be called before publishing")
+    if not self._started:
+      raise RuntimeError("MrosPosePublisher.start() must be called before publishing")
+
+
+def _positive_queue_size(value, name: str) -> int:
+  if isinstance(value, bool):
+    raise ValueError(f"pose_mros.{name} must be a positive integer")
+  try:
+    queue_size = int(value)
+  except (TypeError, ValueError) as exc:
+    raise ValueError(f"pose_mros.{name} must be a positive integer") from exc
+  if queue_size <= 0:
+    raise ValueError(f"pose_mros.{name} must be a positive integer")
+  return queue_size
 
 
 def _validate_pose_matrix(pose: np.ndarray) -> np.ndarray:
@@ -570,12 +559,11 @@ def _validate_pose_matrix(pose: np.ndarray) -> np.ndarray:
 
 
 def rotation_matrix_to_quaternion(rotation: np.ndarray) -> tuple[float, float, float, float]:
-  """Return a normalized ROS-order quaternion (x, y, z, w)."""
+  """Return a normalized (x, y, z, w) quaternion."""
   matrix = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
   if not np.isfinite(matrix).all():
     raise ValueError("Rotation matrix contains NaN or Inf")
 
-  # Project small numerical drift to the nearest proper rotation before conversion.
   u, _, vh = np.linalg.svd(matrix)
   projected = u @ vh
   if np.linalg.det(projected) < 0.0:
@@ -629,7 +617,7 @@ def pose_matrix_to_wheelarm_target(
     base_pose: np.ndarray,
     previous_quaternion_xyzw=None,
 ) -> tuple[list[float], tuple[float, float, float, float]]:
-  """Return [x, y, z, qw, qx, qy, qz] and the ROS-order quaternion."""
+  """Return [x, y, z, qw, qx, qy, qz] and the (x, y, z, w) quaternion."""
   matrix = _validate_pose_matrix(base_pose)
   quaternion = np.asarray(rotation_matrix_to_quaternion(matrix[:3, :3]), dtype=np.float64)
   if previous_quaternion_xyzw is not None:

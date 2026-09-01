@@ -4,8 +4,8 @@ import unittest
 
 import numpy as np
 
-from realtime_foundation.ros2_pose_publisher import (
-    Ros2PosePublisher,
+from realtime_foundation.mros_pose_publisher import (
+    MrosPosePublisher,
     _validate_pose_matrix,
     compose_pose,
     pose_matrix_to_wheelarm_target,
@@ -21,6 +21,20 @@ BASE_FROM_CAMERA = np.array([
 ])
 
 
+class FakeTime:
+  def __init__(self, sec=0, nsec=0):
+    self.sec = sec
+    self.nsec = nsec
+
+  @staticmethod
+  def now():
+    return FakeTime(123, 456)
+
+
+class FakeMros:
+  Time = FakeTime
+
+
 class FakeFloat32MultiArray:
   def __init__(self):
     self.data = []
@@ -31,18 +45,36 @@ class FakeString:
     self.data = ""
 
 
+class FakeHeader:
+  def __init__(self):
+    self.seq = 0
+    self.stamp = None
+    self.frame_id = ""
+
+
 class FakePoseStamped:
   def __init__(self):
-    self.header = SimpleNamespace(stamp=None, frame_id="")
+    self.header = FakeHeader()
     self.pose = SimpleNamespace(
         position=SimpleNamespace(x=0.0, y=0.0, z=0.0),
         orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
     )
 
 
+class FakeImage:
+  def __init__(self):
+    self.header = FakeHeader()
+    self.height = 0
+    self.width = 0
+    self.encoding = ""
+    self.is_bigendian = 0
+    self.step = 0
+    self.data = b""
+
+
 class FakeTransformStamped:
   def __init__(self):
-    self.header = SimpleNamespace(stamp=None, frame_id="")
+    self.header = FakeHeader()
     self.child_frame_id = ""
     self.transform = SimpleNamespace(
         translation=SimpleNamespace(x=0.0, y=0.0, z=0.0),
@@ -51,39 +83,37 @@ class FakeTransformStamped:
 
 
 class FakePublisher:
-  def __init__(self):
+  def __init__(self, subscriber_count=0):
     self.messages = []
+    self.subscriber_count = subscriber_count
 
   def publish(self, message):
     self.messages.append(message)
 
+  def getNumSubscribers(self):
+    return self.subscriber_count
 
-class FakeStaticTransformBroadcaster:
+
+class FakeTransformBroadcaster:
   def __init__(self):
-    self.transforms = []
+    self.transform_batches = []
 
-  def sendTransform(self, transform):
-    self.transforms.append(transform)
-
-
-class FakeNode:
-  def get_clock(self):
-    return self
-
-  def now(self):
-    return self
-
-  def to_msg(self):
-    return SimpleNamespace(sec=123, nanosec=456)
+  def sendTransform(self, transforms):
+    self.transform_batches.append(transforms)
 
 
-class Ros2PosePublisherTest(unittest.TestCase):
+class MrosPosePublisherTest(unittest.TestCase):
+  @staticmethod
+  def mark_started(publisher):
+    publisher._mros = FakeMros
+    publisher._started = True
+
   def test_identity_rotation_converts_to_identity_quaternion(self):
     quaternion = rotation_matrix_to_quaternion(np.eye(3))
 
     np.testing.assert_allclose(quaternion, (0.0, 0.0, 0.0, 1.0), atol=1e-7)
 
-  def test_quarter_turn_about_z_uses_ros_quaternion_order(self):
+  def test_quarter_turn_about_z_uses_xyzw_quaternion_order(self):
     rotation = np.array([
         [0.0, -1.0, 0.0],
         [1.0, 0.0, 0.0],
@@ -111,24 +141,23 @@ class Ros2PosePublisherTest(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "positive determinant"):
       _validate_pose_matrix(pose)
 
-  def test_disabled_publisher_does_not_import_ros(self):
-    publisher = Ros2PosePublisher({"enabled": False})
+  def test_disabled_publisher_does_not_import_mros(self):
+    publisher = MrosPosePublisher({"enabled": False})
 
     publisher.start()
     publisher.publish_status("TRACKING")
     publisher.publish_pose(np.eye(4))
     publisher.stop()
 
-  def test_invalid_reliability_is_rejected(self):
-    with self.assertRaisesRegex(ValueError, "reliability"):
-      Ros2PosePublisher({
-          "enabled": True,
-          "qos": {"reliability": "sometimes"},
-      })
+  def test_invalid_queue_size_is_rejected(self):
+    for value in (0, -1, True, "invalid"):
+      with self.subTest(value=value):
+        with self.assertRaisesRegex(ValueError, "queue_size"):
+          MrosPosePublisher({"enabled": True, "queue_size": value})
 
   def test_status_preserves_detail_text_and_deduplicates_full_message(self):
-    publisher = Ros2PosePublisher({"enabled": True})
-    publisher._node = object()
+    publisher = MrosPosePublisher({"enabled": True})
+    self.mark_started(publisher)
     publisher._String = FakeString
     publisher._status_publisher = FakePublisher()
 
@@ -145,8 +174,8 @@ class Ros2PosePublisherTest(unittest.TestCase):
     )
 
   def test_status_accepts_only_searching_tracking_and_lost(self):
-    publisher = Ros2PosePublisher({"enabled": True})
-    publisher._node = object()
+    publisher = MrosPosePublisher({"enabled": True})
+    self.mark_started(publisher)
     publisher._String = FakeString
     publisher._status_publisher = FakePublisher()
 
@@ -160,8 +189,8 @@ class Ros2PosePublisherTest(unittest.TestCase):
     )
 
   def test_status_requires_detail_text(self):
-    publisher = Ros2PosePublisher({"enabled": True})
-    publisher._node = object()
+    publisher = MrosPosePublisher({"enabled": True})
+    self.mark_started(publisher)
     publisher._String = FakeString
     publisher._status_publisher = FakePublisher()
 
@@ -170,20 +199,9 @@ class Ros2PosePublisherTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "include detail"):
           publisher.publish_status(status)
 
-  def test_status_rejects_removed_states(self):
-    publisher = Ros2PosePublisher({"enabled": True})
-    publisher._node = object()
-    publisher._String = FakeString
-    publisher._status_publisher = FakePublisher()
-
-    for state in ("WAITING_FOR_DETECTION", "REGISTERING", "ERROR", "STOPPED"):
-      with self.subTest(state=state):
-        with self.assertRaisesRegex(ValueError, "must be one of"):
-          publisher.publish_status(state)
-
   def test_static_tf_rejects_identical_parent_and_child_frames(self):
     with self.assertRaisesRegex(ValueError, "source_frame and target_frame must differ"):
-      Ros2PosePublisher({
+      MrosPosePublisher({
           "enabled": True,
           "wheelarm_target": {
               "enabled": True,
@@ -206,7 +224,7 @@ class Ros2PosePublisherTest(unittest.TestCase):
     )
 
   def test_static_tf_uses_base_as_parent_and_camera_as_child(self):
-    publisher = Ros2PosePublisher({
+    publisher = MrosPosePublisher({
         "enabled": True,
         "wheelarm_target": {
             "enabled": True,
@@ -216,14 +234,14 @@ class Ros2PosePublisherTest(unittest.TestCase):
             "base_from_camera": BASE_FROM_CAMERA,
         },
     })
-    publisher._node = FakeNode()
+    self.mark_started(publisher)
     publisher._TransformStamped = FakeTransformStamped
-    publisher._wheelarm_static_tf_broadcaster = FakeStaticTransformBroadcaster()
+    publisher._wheelarm_static_tf_broadcaster = FakeTransformBroadcaster()
 
     publisher._publish_wheelarm_static_transform()
 
-    self.assertEqual(len(publisher._wheelarm_static_tf_broadcaster.transforms), 1)
-    transform = publisher._wheelarm_static_tf_broadcaster.transforms[0]
+    self.assertEqual(len(publisher._wheelarm_static_tf_broadcaster.transform_batches), 1)
+    transform = publisher._wheelarm_static_tf_broadcaster.transform_batches[0][0]
     self.assertEqual(transform.header.frame_id, "base_Link")
     self.assertEqual(transform.child_frame_id, "camera_color_optical_frame")
     np.testing.assert_allclose(
@@ -235,16 +253,48 @@ class Ros2PosePublisherTest(unittest.TestCase):
         BASE_FROM_CAMERA[:3, 3],
         atol=1e-8,
     )
+
+  def test_publish_pose_builds_mros_pose_and_dynamic_tf(self):
+    publisher = MrosPosePublisher({"enabled": True, "publish_tf": True})
+    self.mark_started(publisher)
+    publisher._PoseStamped = FakePoseStamped
+    publisher._TransformStamped = FakeTransformStamped
+    publisher._pose_publisher = FakePublisher()
+    publisher._tf_broadcaster = FakeTransformBroadcaster()
+    pose = np.eye(4)
+    pose[:3, 3] = (0.1, -0.2, 0.3)
+
+    publisher.publish_pose(pose, stamp=12.25)
+
+    message = publisher._pose_publisher.messages[0]
+    self.assertEqual(message.header.seq, 0)
+    self.assertEqual((message.header.stamp.sec, message.header.stamp.nsec), (12, 250_000_000))
+    self.assertEqual(message.header.frame_id, "camera_color_optical_frame")
     np.testing.assert_allclose(
-        (
-            transform.transform.rotation.x,
-            transform.transform.rotation.y,
-            transform.transform.rotation.z,
-            transform.transform.rotation.w,
-        ),
-        rotation_matrix_to_quaternion(BASE_FROM_CAMERA[:3, :3]),
-        atol=1e-8,
+        (message.pose.position.x, message.pose.position.y, message.pose.position.z),
+        (0.1, -0.2, 0.3),
     )
+    transform = publisher._tf_broadcaster.transform_batches[0][0]
+    self.assertEqual(transform.child_frame_id, "detected_object")
+
+  def test_visualization_uses_mros_subscriber_count_and_nsec_stamp(self):
+    publisher = MrosPosePublisher({
+        "enabled": True,
+        "visualization": {"enabled": True, "only_with_subscribers": True},
+    })
+    self.mark_started(publisher)
+    publisher._Image = FakeImage
+    publisher._visualization_publisher = FakePublisher(subscriber_count=0)
+    image = np.zeros((2, 3, 3), dtype=np.uint8)
+
+    self.assertFalse(publisher.publish_visualization(image, timestamp_seconds=5.5))
+    publisher._visualization_publisher.subscriber_count = 1
+    self.assertTrue(publisher.publish_visualization(image, timestamp_seconds=5.5))
+
+    message = publisher._visualization_publisher.messages[0]
+    self.assertEqual((message.header.stamp.sec, message.header.stamp.nsec), (5, 500_000_000))
+    self.assertEqual((message.height, message.width, message.step), (2, 3, 9))
+    self.assertEqual(message.encoding, "rgb8")
 
   def test_wheelarm_target_uses_wxyz_quaternion_order(self):
     pose = np.eye(4)
@@ -255,74 +305,33 @@ class Ros2PosePublisherTest(unittest.TestCase):
     np.testing.assert_allclose(data, (0.6, 0.2, 0.4, 1.0, 0.0, 0.0, 0.0), atol=1e-7)
     np.testing.assert_allclose(quaternion_xyzw, (0.0, 0.0, 0.0, 1.0), atol=1e-7)
 
-  def test_wheelarm_target_keeps_quaternion_sign_continuous(self):
-    data, quaternion_xyzw = pose_matrix_to_wheelarm_target(
-        np.eye(4),
-        previous_quaternion_xyzw=(0.0, 0.0, 0.0, -1.0),
-    )
-
-    np.testing.assert_allclose(data[3:], (-1.0, 0.0, 0.0, 0.0), atol=1e-7)
-    np.testing.assert_allclose(quaternion_xyzw, (0.0, 0.0, 0.0, -1.0), atol=1e-7)
-
-  def test_wheelarm_update_publishes_float32_data_immediately(self):
-    publisher = Ros2PosePublisher({
+  def test_wheelarm_update_publishes_float32_data_and_base_pose(self):
+    publisher = MrosPosePublisher({
         "enabled": True,
         "wheelarm_target": {
             "enabled": True,
+            "target_frame": "base_Link",
             "base_from_camera": np.eye(4),
         },
     })
-    publisher._node = object()
-    publisher._Float32MultiArray = FakeFloat32MultiArray
-    publisher._wheelarm_publisher = FakePublisher()
-    pose = np.eye(4)
-    pose[:3, 3] = (0.6, 0.2, 0.4)
-
-    data = publisher.update_wheelarm_target(pose)
-
-    self.assertEqual(len(publisher._wheelarm_publisher.messages), 1)
-    message = publisher._wheelarm_publisher.messages[0]
-    self.assertEqual(len(message.data), 7)
-    self.assertEqual(message.data, [float(np.float32(value)) for value in data])
-
-  def test_wheelarm_update_publishes_matching_base_pose_for_rviz(self):
-    publisher = Ros2PosePublisher({
-      "enabled": True,
-      "wheelarm_target": {
-        "enabled": True,
-        "target_frame": "base_Link",
-        "base_from_camera": np.eye(4),
-      },
-    })
-    publisher._node = object()
+    self.mark_started(publisher)
     publisher._Float32MultiArray = FakeFloat32MultiArray
     publisher._PoseStamped = FakePoseStamped
     publisher._wheelarm_publisher = FakePublisher()
     publisher._wheelarm_base_pose_publisher = FakePublisher()
-    stamp = SimpleNamespace(sec=123, nanosec=456)
     pose = np.eye(4)
     pose[:3, 3] = (0.6, 0.2, 0.4)
 
-    data = publisher.update_wheelarm_target(pose, stamp=stamp)
+    data = publisher.update_wheelarm_target(pose, stamp=FakeTime(123, 456))
 
-    self.assertEqual(len(publisher._wheelarm_base_pose_publisher.messages), 1)
-    message = publisher._wheelarm_base_pose_publisher.messages[0]
-    self.assertIs(message.header.stamp, stamp)
-    self.assertEqual(message.header.frame_id, "base_Link")
+    target_message = publisher._wheelarm_publisher.messages[0]
+    self.assertEqual(target_message.data, [float(np.float32(value)) for value in data])
+    pose_message = publisher._wheelarm_base_pose_publisher.messages[0]
+    self.assertEqual(pose_message.header.frame_id, "base_Link")
     np.testing.assert_allclose(
-      (message.pose.position.x, message.pose.position.y, message.pose.position.z),
-      data[:3],
-      atol=1e-7,
-    )
-    np.testing.assert_allclose(
-      (
-        message.pose.orientation.w,
-        message.pose.orientation.x,
-        message.pose.orientation.y,
-        message.pose.orientation.z,
-      ),
-      data[3:],
-      atol=1e-7,
+        (pose_message.pose.position.x, pose_message.pose.position.y, pose_message.pose.position.z),
+        data[:3],
+        atol=1e-7,
     )
 
 

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-CONTAINER_NAME="${CONTAINER_NAME:-foundationpose-jetson-ros2}"
+CONTAINER_NAME="${CONTAINER_NAME:-foundationpose-jetson}"
 FULL_INTERVAL_MS="${FULL_INTERVAL_MS:-200}"
 FAST_INTERVAL_MS="${FAST_INTERVAL_MS:-50}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/realtime_foundation/outputs}"
@@ -126,11 +126,11 @@ if "${DOCKER[@]}" inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/nul
   fi
 fi
 
-runtime_shell="source /opt/ros/humble/setup.bash && cd /workspace/yolo_foundationpose && echo \$\$ > '${CONTAINER_RUN_DIR}/runtime.container.pid' && exec python3 realtime_foundation/run_realtime.py --config realtime_foundation/config.yaml"
+runtime_shell="cd /workspace/yolo_foundationpose && echo \$\$ > '${CONTAINER_RUN_DIR}/runtime.container.pid' && exec python3 realtime_foundation/run_realtime.py --config realtime_foundation/config.yaml"
 
 echo "[TELEMETRY] artifacts=${RELATIVE_RUN_DIR}"
 echo "[TELEMETRY] full=${FULL_INTERVAL_MS}ms fast=${FAST_INTERVAL_MS}ms"
-echo "[TELEMETRY] start rosbag playback after ROS2 subscriptions are ready"
+echo "[TELEMETRY] start the mROS camera publisher before collecting runtime data"
 
 set +e
 if [[ "${container_running}" == true ]]; then
@@ -138,7 +138,7 @@ if [[ "${container_running}" == true ]]; then
     bash -lc "${runtime_shell}" > >(tee "${RUN_DIR}/runtime.log") 2>&1
   runtime_status=$?
 else
-  bash "${SCRIPT_DIR}/run_container_jetson_ros2.sh" \
+  bash "${SCRIPT_DIR}/run_container_jetson.sh" \
     bash -lc "${runtime_shell}" > >(tee "${RUN_DIR}/runtime.log") 2>&1
   runtime_status=$?
 fi

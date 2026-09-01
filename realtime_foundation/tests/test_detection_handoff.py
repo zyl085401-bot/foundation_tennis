@@ -21,11 +21,13 @@ def load_runtime_module():
       "camera.realsense_reader": types.ModuleType("camera.realsense_reader"),
       "detection": types.ModuleType("detection"),
       "detection.yolo_segmenter": types.ModuleType("detection.yolo_segmenter"),
+      "mros_pose_publisher": types.ModuleType("mros_pose_publisher"),
       "tracking": types.ModuleType("tracking"),
       "tracking.foundationpose_tracker": types.ModuleType("tracking.foundationpose_tracker"),
   }
   stubs["camera.realsense_reader"].RealSenseReader = object
   stubs["detection.yolo_segmenter"].YoloSegmenter = object
+  stubs["mros_pose_publisher"].MrosPosePublisher = object
   stubs["tracking.foundationpose_tracker"].FoundationPoseRealtimeTracker = object
   previous = {name: sys.modules.get(name) for name in stubs}
   sys.modules.update(stubs)

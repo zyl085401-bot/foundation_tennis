@@ -18,7 +18,7 @@ import yaml
 
 from camera.realsense_reader import RealSenseReader
 from detection.yolo_segmenter import YoloSegmenter
-from ros2_pose_publisher import Ros2PosePublisher
+from mros_pose_publisher import MrosPosePublisher
 from tracking.foundationpose_tracker import FoundationPoseRealtimeTracker
 
 
@@ -1714,7 +1714,7 @@ def main() -> None:
   yolo_cfg = cfg.get("yolo", {})
   tracker_cfg = cfg.get("foundationpose", {})
   runtime_cfg = cfg.get("runtime", {})
-  pose_ros2_cfg = cfg.get("pose_ros2", {})
+  pose_mros_cfg = cfg.get("pose_mros", {})
   runtime_mode = str(runtime_cfg.get("mode", "realtime")).lower()
   init_only = runtime_mode in ("init_only", "initialize_only", "register_only")
   success_timing_only = bool(runtime_cfg.get("success_timing_only", False))
@@ -1798,7 +1798,7 @@ def main() -> None:
         summary_interval=int(predictability_cfg.get("summary_interval", 25)),
     )
 
-  pose_publisher = Ros2PosePublisher(pose_ros2_cfg)
+  pose_publisher = MrosPosePublisher(pose_mros_cfg)
   visualization_output_enabled = show_window or pose_publisher.visualization_enabled
 
   def output_debug_frame(image_rgb: np.ndarray, timestamp: float) -> bool:
