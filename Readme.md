@@ -4,32 +4,9 @@
 python run_demo.py --vis_mode contour
 
 # 仿真
-python3 realtime_foundation/simulate_recorded_camera.py \
+python3 realtime_foundation/tools/simulate_recorded_camera.py \
   --input realtime_foundation/outputs/error/refiner_coarse_160/frame_001172_register.npz \
   --config realtime_foundation/config.yaml
-
-# 如需查看同一次 register 的完整候选筛选流水线，将 config.yaml 最底部的
-# simulation.candidate_pipeline_debug_enabled 改为 true。结果保存在：
-# outputs/simulated_results/<帧名>/candidate_pipeline/repeat_001/
-# 其中 candidate_pipeline.json/npz 保存完整数据，各阶段 *_contact_sheet.jpg 用于人工检查。
-
-export DISPLAY=:0
-xhost +si:localuser:root
-
-cd ~/workspace/yolo_foundationpose_ball_20hz
-
-bash FoundationPose/docker/run_container_jetson.sh \
-  python3 realtime_foundation/run_realtime.py \
-  --config realtime_foundation/config.yaml
-
-# 在基础容器里启动相机发布器 启动RealSense并通过mROS发布彩色、对齐深度和相机内参话题
-cd /home/nvidia/workspace/yolo_foundationpose_ball_20hz
-
-CONTAINER_NAME=foundationpose-mros-camera \
-bash FoundationPose/docker/run_container_jetson.sh \
-python3 realtime_foundation/camera/depth_color_publish \
-  --config realtime_foundation/config.yaml
-
 
 # 在联网的x86_64开发机准备Jetson Python 3.10/aarch64的mROS离线依赖。
 bash FoundationPose/docker/prepare_jetson_mros_offline.sh
@@ -52,7 +29,7 @@ bash FoundationPose/docker/run_jetson_telemetry.sh
   FoundationPose/demo_data/tennis/mesh/textured_simple.obj \
   FoundationPose/demo_data/tennis/mesh/textured_simple_0.03125.obj \
   --triangle-ratio 0.03125
-
+###################################################################################################
 # 在外部x86主机连接NX上的mROS Agent。
 export MROS_AGENT_URI=tcp://192.168.55.2:11315
 mrostopic list
@@ -61,3 +38,22 @@ mrostopic list
 source /home/nvidia/jason/bbs/install/setup.bash
 export MROS_AGENT_IP=192.168.55.2
 mrosagent
+
+# 在基础容器里启动相机发布器 启动RealSense并通过mROS发布彩色、对齐深度和相机内参话题
+cd /home/nvidia/workspace/yolo_foundationpose_ball_20hz
+
+CONTAINER_NAME=foundationpose-mros-camera \
+bash FoundationPose/docker/run_container_jetson.sh \
+python3 realtime_foundation/camera/depth_color_publish \
+  --config realtime_foundation/config.yaml
+
+# 开启foundation流程
+export DISPLAY=:0
+xhost +si:localuser:root
+
+cd ~/workspace/yolo_foundationpose_ball_20hz
+
+bash FoundationPose/docker/run_container_jetson.sh \
+  python3 realtime_foundation/run_realtime.py \
+  --config realtime_foundation/config.yaml
+

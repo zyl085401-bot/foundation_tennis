@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 候选可预测性统计。
 """Replay recorded register frames and evaluate fixed-candidate predictability offline."""
 
 from __future__ import annotations
@@ -9,9 +9,15 @@ import json
 import os
 from pathlib import Path
 import statistics
+import sys
 import time
 
 import numpy as np
+
+
+REALTIME_ROOT = Path(__file__).resolve().parents[1]
+if str(REALTIME_ROOT) not in sys.path:
+  sys.path.insert(0, str(REALTIME_ROOT))
 
 from run_realtime import build_tracker, evaluate_register_quality, load_config
 from simulate_recorded_camera import RecordedFramePublisher
@@ -20,7 +26,7 @@ from simulate_recorded_camera import RecordedFramePublisher
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--input-dir", type=Path, required=True)
-  parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.yaml"))
+  parser.add_argument("--config", type=Path, default=REALTIME_ROOT / "config.yaml")
   parser.add_argument("--output-dir", type=Path, required=True)
   parser.add_argument("--pattern", default="*_register.npz")
   parser.add_argument("--max-samples", type=int)

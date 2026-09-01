@@ -47,6 +47,43 @@ class FakeCameraInfo:
     self.binning_y = 0
 
 
+class FakeColorSensor:
+  def __init__(self):
+    self.set_calls = []
+
+  def supports(self, _option):
+    return True
+
+  def get_option_range(self, option):
+    if option == "enable_auto_exposure":
+      return SimpleNamespace(min=0.0, max=1.0, step=1.0)
+    return SimpleNamespace(min=1.0, max=10000.0, step=1.0)
+
+  def set_option(self, option, value):
+    self.set_calls.append((option, value))
+
+
+class FakeDevice:
+  def __init__(self, color_sensor):
+    self.color_sensor = color_sensor
+
+  def first_color_sensor(self):
+    return self.color_sensor
+
+
+class FakeRealSenseCamera:
+  def __init__(self):
+    self.color_sensor = FakeColorSensor()
+    device = FakeDevice(self.color_sensor)
+    self.profile = SimpleNamespace(get_device=lambda: device)
+    self.rs = SimpleNamespace(
+        option=SimpleNamespace(
+            enable_auto_exposure="enable_auto_exposure",
+            exposure="exposure",
+        )
+    )
+
+
 class MrosCameraPublisherTest(unittest.TestCase):
   def setUp(self):
     self.mros = SimpleNamespace(Time=SimpleNamespace(now=lambda: "now"))
@@ -127,6 +164,91 @@ class MrosCameraPublisherTest(unittest.TestCase):
     self.assertEqual(runtime["color_topic"], "/camera/color/image_raw")
     self.assertEqual(runtime["depth_topic"], "/camera/aligned_depth_to_color/image_raw")
     self.assertEqual(runtime["camera_info_topic"], "/camera/color/camera_info")
+    self.assertTrue(runtime["color_auto_exposure"])
+    self.assertIsNone(runtime["color_exposure_ms"])
+    self.assertNotIn("exposure", runtime)
+
+  def test_runtime_config_accepts_manual_color_shutter_in_ms(self):
+    config = {
+        "camera": {
+            "mros": {
+                "color_topic": "/color",
+                "depth_topic": "/depth",
+                "camera_info_topic": "/info",
+                "publisher_cpu_cores": [min(publisher_module.os.sched_getaffinity(0))],
+                "color_auto_exposure": False,
+                "color_exposure_ms": 12.5,
+            },
+        },
+    }
+
+    runtime = publisher_module.build_runtime_config(config)
+
+    self.assertFalse(runtime["color_auto_exposure"])
+    self.assertEqual(runtime["color_exposure_ms"], 12.5)
+
+  def test_runtime_config_requires_shutter_for_manual_color_exposure(self):
+    config = {
+        "camera": {
+            "mros": {
+                "color_topic": "/color",
+                "depth_topic": "/depth",
+                "camera_info_topic": "/info",
+                "publisher_cpu_cores": [min(publisher_module.os.sched_getaffinity(0))],
+                "color_auto_exposure": False,
+                "color_exposure_ms": None,
+            },
+        },
+    }
+
+    with self.assertRaisesRegex(RuntimeError, "color_exposure_ms"):
+      publisher_module.build_runtime_config(config)
+
+  def test_runtime_config_rejects_non_boolean_exposure_switch(self):
+    config = {
+        "camera": {
+            "mros": {
+                "color_topic": "/color",
+                "depth_topic": "/depth",
+                "camera_info_topic": "/info",
+                "publisher_cpu_cores": [min(publisher_module.os.sched_getaffinity(0))],
+                "color_auto_exposure": "false",
+                "color_exposure_ms": 10.0,
+            },
+        },
+    }
+
+    with self.assertRaisesRegex(RuntimeError, "must be true or false"):
+      publisher_module.build_runtime_config(config)
+
+  def test_auto_exposure_only_toggles_color_sensor_auto_mode(self):
+    camera = FakeRealSenseCamera()
+
+    publisher_module.apply_color_exposure_settings(camera, True, 12.5)
+
+    self.assertEqual(
+        camera.color_sensor.set_calls,
+        [("enable_auto_exposure", 1.0)],
+    )
+
+  def test_manual_color_shutter_converts_ms_to_uvc_units(self):
+    camera = FakeRealSenseCamera()
+
+    publisher_module.apply_color_exposure_settings(camera, False, 12.5)
+
+    self.assertEqual(
+        camera.color_sensor.set_calls,
+        [
+            ("enable_auto_exposure", 0.0),
+            ("exposure", 125.0),
+        ],
+    )
+
+  def test_manual_color_shutter_rejects_unsupported_ms_increment(self):
+    camera = FakeRealSenseCamera()
+
+    with self.assertRaisesRegex(RuntimeError, "0.1 ms increments"):
+      publisher_module.apply_color_exposure_settings(camera, False, 12.55)
 
 
 if __name__ == "__main__":

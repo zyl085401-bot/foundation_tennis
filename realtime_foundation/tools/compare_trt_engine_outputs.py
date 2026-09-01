@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 TensorRT 引擎输出对比。
 """Compare two FoundationPose TensorRT engines on captured real network inputs."""
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any
 import torch
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(REPO_ROOT))
 

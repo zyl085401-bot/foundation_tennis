@@ -25,7 +25,7 @@ realtime_foundation/outputs/frame_records/frame_data
 ```bash
 cd /workspace/yolo_foundationpose
 
-python3 realtime_foundation/detection/yolo_replay_benchmark.py \
+python3 realtime_foundation/tools/yolo_replay_benchmark.py \
   --mode baseline \
   --execution-path legacy \
   --run-name legacy_baseline
@@ -40,7 +40,7 @@ python3 realtime_foundation/detection/yolo_replay_benchmark.py \
 也可以明确指定参数：
 
 ```bash
-python3 realtime_foundation/detection/yolo_replay_benchmark.py \
+python3 realtime_foundation/tools/yolo_replay_benchmark.py \
   --mode baseline \
   --config realtime_foundation/config.yaml \
   --input-dir realtime_foundation/outputs/frame_records/frame_data \
@@ -55,7 +55,7 @@ python3 realtime_foundation/detection/yolo_replay_benchmark.py \
 保持相同 TensorRT 引擎、YOLO 配置和录制帧，运行：
 
 ```bash
-python3 realtime_foundation/detection/yolo_replay_benchmark.py \
+python3 realtime_foundation/tools/yolo_replay_benchmark.py \
   --mode compare \
   --execution-path fast \
   --profile-stages \
@@ -70,7 +70,7 @@ python3 realtime_foundation/detection/yolo_replay_benchmark.py \
 逐帧输出一致性由人工确认后，关闭阶段同步测量生产路径端到端耗时：
 
 ```bash
-python3 realtime_foundation/detection/yolo_replay_benchmark.py \
+python3 realtime_foundation/tools/yolo_replay_benchmark.py \
   --mode compare \
   --execution-path fast \
   --no-profile-stages \
@@ -97,7 +97,7 @@ yolo:
 建立 GPU 基线：
 
 ```bash
-python3 realtime_foundation/detection/yolo_replay_benchmark.py \
+python3 realtime_foundation/tools/yolo_replay_benchmark.py \
   --mode baseline \
   --execution-path fast \
   --postprocess-backend gpu \
@@ -115,7 +115,7 @@ CPU 后处理要求 `execution_path: fast`，并且不会静默退回 legacy GPU
 ```bash
 cd /workspace/yolo_foundationpose
 
-python3 realtime_foundation/detection/build_yolo_int8_engine.py \
+python3 realtime_foundation/tools/build_yolo_int8_engine.py \
   --weights realtime_foundation/yolo_weights/best.pt \
   --frame-dir realtime_foundation/outputs/frame_records/frame_data \
   --calibration-dir realtime_foundation/outputs/int8_calibration/yolo \

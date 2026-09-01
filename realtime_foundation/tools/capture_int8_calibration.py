@@ -1,10 +1,17 @@
+# INT8 校准数据采集。
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 import time
 
 import numpy as np
+
+
+REALTIME_ROOT = Path(__file__).resolve().parents[1]
+if str(REALTIME_ROOT) not in sys.path:
+  sys.path.insert(0, str(REALTIME_ROOT))
 
 from run_realtime import build_tracker, load_config
 

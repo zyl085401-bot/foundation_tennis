@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Jetson 性能数据分析。
 from __future__ import annotations
 
 import argparse

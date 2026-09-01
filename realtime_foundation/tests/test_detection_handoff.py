@@ -52,7 +52,7 @@ runtime = load_runtime_module()
 
 
 def load_analyzer_module():
-  module_path = Path(__file__).resolve().parents[1] / "analyze_jetson_telemetry.py"
+  module_path = Path(__file__).resolve().parents[1] / "tools" / "analyze_jetson_telemetry.py"
   spec = importlib.util.spec_from_file_location("analyze_jetson_telemetry_test", module_path)
   if spec is None or spec.loader is None:
     raise RuntimeError(f"Unable to load {module_path}")

@@ -49,15 +49,15 @@ mkdir -p "${RUN_DIR}"
   sha256sum \
     "${REPO_ROOT}/realtime_foundation/run_realtime.py" \
     "${REPO_ROOT}/realtime_foundation/config.yaml" \
-    "${REPO_ROOT}/realtime_foundation/jetson_telemetry.py" \
-    "${REPO_ROOT}/realtime_foundation/analyze_jetson_telemetry.py"
+    "${REPO_ROOT}/realtime_foundation/tools/jetson_telemetry.py" \
+    "${REPO_ROOT}/realtime_foundation/tools/analyze_jetson_telemetry.py"
   echo
   nvpmodel -q 2>&1 || true
   echo
   jetson_clocks --show 2>&1 || true
 } > "${RUN_DIR}/metadata.txt"
 
-setsid /usr/bin/python3 -u "${REPO_ROOT}/realtime_foundation/jetson_telemetry.py" \
+setsid /usr/bin/python3 -u "${REPO_ROOT}/realtime_foundation/tools/jetson_telemetry.py" \
   --output-dir "${RUN_DIR}" \
   --full-interval-ms "${FULL_INTERVAL_MS}" \
   --fast-interval-ms "${FAST_INTERVAL_MS}" \
@@ -106,7 +106,7 @@ cleanup() {
   } >> "${RUN_DIR}/metadata.txt"
 
   if [[ -s "${RUN_DIR}/runtime.log" ]]; then
-    /usr/bin/python3 "${REPO_ROOT}/realtime_foundation/analyze_jetson_telemetry.py" "${RUN_DIR}" \
+    /usr/bin/python3 "${REPO_ROOT}/realtime_foundation/tools/analyze_jetson_telemetry.py" "${RUN_DIR}" \
       > "${RUN_DIR}/analysis_stdout.log" \
       2> "${RUN_DIR}/analysis_stderr.log" || true
   fi

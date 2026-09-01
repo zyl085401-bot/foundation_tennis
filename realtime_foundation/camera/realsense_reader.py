@@ -8,7 +8,11 @@ import time
 import numpy as np
 
 
-DEFAULT_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "realsense_config.yml")
+DEFAULT_CONFIG_FILE = os.path.join(
+  os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+  "tools",
+  "realsense_config.yml",
+)
 
 
 class RealSenseReader:

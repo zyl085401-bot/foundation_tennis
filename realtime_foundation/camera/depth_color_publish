@@ -94,12 +94,10 @@ def optional_non_negative_float(config: dict, name: str) -> float | None:
   return result
 
 
-def optional_bool(config: dict, name: str) -> bool | None:
-  value = config.get(name)
-  if value is None:
-    return None
+def boolean(config: dict, name: str, default: bool) -> bool:
+  value = config.get(name, default)
   if not isinstance(value, bool):
-    raise RuntimeError(f"camera.mros.{name} must be true, false, or null")
+    raise RuntimeError(f"camera.mros.{name} must be true or false")
   return value
 
 
@@ -151,20 +149,15 @@ def build_runtime_config(config: dict) -> dict:
   if log_interval_sec is None:
     log_interval_sec = 1.0
 
-  exposure = {}
-  for stream in ("color", "depth"):
-    auto = optional_bool(mros_config, f"{stream}_auto_exposure")
-    exposure_ms = optional_non_negative_float(mros_config, f"{stream}_exposure_ms")
-    gain = optional_non_negative_float(mros_config, f"{stream}_gain")
-    if auto is True and (exposure_ms is not None or gain is not None):
-      raise RuntimeError(
-          f"camera.mros.{stream}_auto_exposure cannot be true when manual exposure or gain is set"
-      )
-    exposure[stream] = {
-        "auto": auto,
-        "exposure_ms": exposure_ms,
-        "gain": gain,
-    }
+  color_auto_exposure = boolean(mros_config, "color_auto_exposure", True)
+  color_exposure_ms = optional_non_negative_float(mros_config, "color_exposure_ms")
+  if color_exposure_ms is not None and color_exposure_ms <= 0.0:
+    raise RuntimeError("camera.mros.color_exposure_ms must be null or a positive number in ms")
+  if not color_auto_exposure and color_exposure_ms is None:
+    raise RuntimeError(
+        "camera.mros.color_exposure_ms must be set to a positive number in ms "
+        "when color_auto_exposure=false"
+    )
 
   return {
       "width": width,
@@ -183,7 +176,8 @@ def build_runtime_config(config: dict) -> dict:
       "queue_size": queue_size,
       "cpu_cores": cpu_cores(mros_config),
       "log_interval_sec": log_interval_sec,
-      "exposure": exposure,
+      "color_auto_exposure": color_auto_exposure,
+      "color_exposure_ms": color_exposure_ms,
   }
 
 
@@ -202,33 +196,48 @@ def _set_sensor_option(sensor, option, value, label: str) -> None:
   sensor.set_option(option, numeric_value)
 
 
-def apply_exposure_settings(camera: RealSenseReader, exposure: dict) -> None:
+def _set_color_exposure_ms(sensor, option, exposure_ms: float) -> None:
+  if not sensor.supports(option):
+    raise RuntimeError("RealSense color sensor does not support manual exposure")
+  option_range = sensor.get_option_range(option)
+  # The UVC color exposure control uses 100-microsecond units.
+  option_value = float(exposure_ms) * 10.0
+  if option_value < option_range.min or option_value > option_range.max:
+    raise RuntimeError(
+        f"RealSense color exposure={exposure_ms:g} ms is outside "
+        f"[{option_range.min / 10.0:g}, {option_range.max / 10.0:g}] ms"
+    )
+  option_step = float(getattr(option_range, "step", 0.0))
+  if option_step > 0.0:
+    nearest_value = option_range.min + round(
+        (option_value - option_range.min) / option_step
+    ) * option_step
+    if not math.isclose(option_value, nearest_value, rel_tol=0.0, abs_tol=1e-6):
+      raise RuntimeError(
+          f"RealSense color exposure={exposure_ms:g} ms must use "
+          f"{option_step / 10.0:g} ms increments"
+      )
+  sensor.set_option(option, option_value)
+
+
+def apply_color_exposure_settings(
+    camera: RealSenseReader,
+    auto_exposure: bool,
+    exposure_ms: float | None,
+) -> None:
   device = camera.profile.get_device()
   rs = camera.rs
-  sensors = {
-      "color": device.first_color_sensor(),
-      "depth": device.first_depth_sensor(),
-  }
-  for stream, sensor in sensors.items():
-    settings = exposure[stream]
-    auto = settings["auto"]
-    exposure_ms = settings["exposure_ms"]
-    gain = settings["gain"]
-    if auto is not None or exposure_ms is not None or gain is not None:
-      _set_sensor_option(
-          sensor,
-          rs.option.enable_auto_exposure,
-          1.0 if (auto if auto is not None else False) else 0.0,
-          f"{stream} auto exposure",
-      )
-    if exposure_ms is not None:
-      _set_sensor_option(
-          sensor,
-          rs.option.exposure,
-          exposure_ms * 1000.0,
-          f"{stream} exposure (microseconds)",
-      )
-    _set_sensor_option(sensor, rs.option.gain, gain, f"{stream} gain")
+  color_sensor = device.first_color_sensor()
+  _set_sensor_option(
+      color_sensor,
+      rs.option.enable_auto_exposure,
+      1.0 if auto_exposure else 0.0,
+      "color auto exposure",
+  )
+  if not auto_exposure:
+    if exposure_ms is None:
+      raise RuntimeError("Manual color exposure requires a shutter value in ms")
+    _set_color_exposure_ms(color_sensor, rs.option.exposure, exposure_ms)
 
 
 def _new_stamp(mros, timestamp=None):
@@ -336,7 +345,11 @@ def run_publisher(runtime: dict) -> None:
         runtime["camera_info_topic"], CameraInfo, False, 1
     )
     camera.start()
-    apply_exposure_settings(camera, runtime["exposure"])
+    apply_color_exposure_settings(
+        camera,
+        runtime["color_auto_exposure"],
+        runtime["color_exposure_ms"],
+    )
 
     print("[mROS RealSense] Publishers started")
     print(f"  node: {runtime['node_name']}")
@@ -403,6 +416,13 @@ def print_runtime(runtime: dict, config_path: Path) -> None:
       f"[mROS RealSense] stream: {runtime['width']}x{runtime['height']}@{runtime['fps']}, "
       f"frame={runtime['frame_id']}, CPU={runtime['cpu_cores']}"
   )
+  if runtime["color_auto_exposure"]:
+    print("[mROS RealSense] color exposure: auto")
+  else:
+    print(
+        f"[mROS RealSense] color exposure: manual, "
+        f"shutter={runtime['color_exposure_ms']:g} ms"
+    )
 
 
 def main() -> int:

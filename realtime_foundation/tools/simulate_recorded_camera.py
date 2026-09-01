@@ -1,3 +1,4 @@
+# 录制帧回放。
 from __future__ import annotations
 
 import argparse
@@ -5,11 +6,18 @@ from dataclasses import dataclass
 import json
 import math
 import os
+from pathlib import Path
 import shutil
+import sys
 import time
 
 import cv2
 import numpy as np
+
+
+REALTIME_ROOT = Path(__file__).resolve().parents[1]
+if str(REALTIME_ROOT) not in sys.path:
+  sys.path.insert(0, str(REALTIME_ROOT))
 
 from run_realtime import (
     FrameMessage,
@@ -98,7 +106,7 @@ def parse_args() -> argparse.Namespace:
 def infer_paths(input_path: str, config_path: str | None, output_dir: str | None) -> tuple[str, str]:
   record_root = os.path.dirname(os.path.dirname(os.path.abspath(input_path)))
   if config_path is None:
-    config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    config_path = str(REALTIME_ROOT / "config.yaml")
   output_dir = output_dir or os.path.join(record_root, "simulated_results")
   return os.path.abspath(config_path), os.path.abspath(output_dir)
 
@@ -758,8 +766,8 @@ def main() -> None:
 if __name__ == "__main__":
   main()
 
-# python realtime_foundation/simulate_recorded_camera.py \
+# python realtime_foundation/tools/simulate_recorded_camera.py \
 #  --input realtime_foundation/outputs/frame_records/frame_data/frame_000057_register.npz
 
 # 重复运行同一帧，测试同一输入是否偶发选择不同姿态：
-# python simulate_recorded_camera.py --input ./outputs/error/frame_001095_register.npz --config ./config.yaml --repeat 20
+# python realtime_foundation/tools/simulate_recorded_camera.py --input ./outputs/error/frame_001095_register.npz --config ./realtime_foundation/config.yaml --repeat 20

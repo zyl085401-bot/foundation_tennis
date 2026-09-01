@@ -13,7 +13,11 @@ from typing import Any
 import numpy as np
 
 
-DEFAULT_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolo_segment_config.yml")
+DEFAULT_CONFIG_FILE = os.path.join(
+  os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+  "tools",
+  "yolo_segment_config.yml",
+)
 
 
 def read_ultralytics_engine_metadata(path: str) -> dict[str, Any]:

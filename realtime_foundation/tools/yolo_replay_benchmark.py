@@ -1,3 +1,4 @@
+# YOLO 回放性能基准。
 from __future__ import annotations
 
 import argparse
@@ -19,7 +20,14 @@ from typing import Any
 import numpy as np
 import yaml
 
-from yolo_segmenter import YoloMaskResult, YoloSegmenter
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REALTIME_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = REALTIME_ROOT.parent
+if str(REALTIME_ROOT) not in sys.path:
+  sys.path.insert(0, str(REALTIME_ROOT))
+
+from detection.yolo_segmenter import YoloMaskResult, YoloSegmenter
 
 
 # ==================== 可直接修改的默认路径 ====================
@@ -36,9 +44,6 @@ BASELINE_MASK_COLOR_RGB = (0, 220, 80)
 CURRENT_MASK_COLOR_RGB = (255, 120, 0)
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-REALTIME_ROOT = SCRIPT_DIR.parent
-REPO_ROOT = REALTIME_ROOT.parent
 DEFAULT_CONFIG = (
   BENCHMARK_CONFIG_PATH
   if BENCHMARK_CONFIG_PATH.is_absolute()

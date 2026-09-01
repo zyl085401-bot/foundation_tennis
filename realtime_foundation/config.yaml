@@ -18,12 +18,8 @@ camera:
     publisher_cpu_cores: [0, 1]
     publisher_log_interval_sec: 1.0
     frame_id: camera_color_optical_frame
-    color_auto_exposure: true
-    color_exposure_ms: null
-    color_gain: null
-    depth_auto_exposure: null
-    depth_exposure_ms: null
-    depth_gain: null
+    color_auto_exposure: true  # true：彩色图自动曝光；false：彩色图手动曝光。
+    color_exposure_ms: 50  # 手动曝光时必须填写正数，单位ms；自动曝光时忽略。
     depth_scale: 0.001
     sync_queue_size: 10
     sync_slop_sec: 0.03
@@ -353,7 +349,7 @@ runtime:
   pose_output: realtime_foundation/outputs/latest_pose.txt
   loop_sleep: 0.0
 
-# 单帧 NPZ 回放候选流水线诊断。仅由 simulate_recorded_camera.py 读取；
+# 单帧 NPZ 回放候选流水线诊断。仅由 tools/simulate_recorded_camera.py 读取；
 # 开启后保存各阶段联系图、固定候选 ID、Pose/更新量、筛选指标、JSON 和 NPZ。
 # 会增加 GPU 渲染、CPU 同步和磁盘写入耗时，实时生产路径不会读取此开关。
 simulation:
