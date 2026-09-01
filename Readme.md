@@ -46,26 +46,7 @@ python3 -c 'import mros, pyrealsense2; print(mros.__file__)'
 bash FoundationPose/docker/run_jetson_telemetry.sh
 
 
-# 初始化阶段的数据流与计时
-
-# tracker 未初始化时，主线程直接等待新的 YOLO DetectionMessage。YOLO
-# 发布候选目标后会唤醒主线程，并暂停提交下一帧推理；主线程立即使用消息
-# 自带的同帧 RGB、depth、K 和 mask 执行 FoundationPose register。候选被
-# 拒绝、register 失败或 init_only 完成并 reset 后，YOLO 恢复搜索。
-#
-# timing summary 中：
-#   yolo_total                       YOLO 纯检测计算时间
-#   foundation_total                 FoundationPose register 计算时间
-#   yolo_foundation_compute_total    上述两项之和（纯模型计算总时间）
-#   detection_consume_delay          YOLO 完成到主线程取得结果的通知/调度延迟
-#   init_total                       YOLO 开始到初始化质量检查通过的端到端时间
-
 # 减小mesh模型的大小
-  python3 FoundationPose/tools/generate_textured_lod.py \
-  FoundationPose/demo_data/cup0708/mesh/textured_simple.obj \
-  FoundationPose/demo_data/cup0708/mesh/textured_simple_lod3.obj \
-  --target-triangles 7000
-
 
   python3 FoundationPose/tools/generate_textured_lod.py \
   FoundationPose/demo_data/tennis/mesh/textured_simple.obj \
@@ -75,13 +56,6 @@ bash FoundationPose/docker/run_jetson_telemetry.sh
 # 在外部x86主机连接NX上的mROS Agent。
 export MROS_AGENT_URI=tcp://192.168.55.2:11315
 mrostopic list
-
-# FoundationPose通过mROS发布以下结果：
-# /foundationpose/object_pose
-# /foundationpose/object_pose_base
-# /foundationpose/status
-# /foundationpose/visualization
-# /wheelarm/target
 
 
 source /home/nvidia/jason/bbs/install/setup.bash

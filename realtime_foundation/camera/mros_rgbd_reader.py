@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import dataclass
 import math
 from pathlib import Path
+import threading
 import time
 
 import numpy as np
@@ -194,6 +195,7 @@ class MrosRgbdReader:
       sync_queue_size: int = 10,
       sync_slop_sec: float = 0.03,
       frame_timeout_sec: float = 5.0,
+      disconnect_timeout_sec: float = 3.0,
       node_name: str = "foundationpose_rgbd_reader",
       reliable: bool = False,
   ):
@@ -208,6 +210,7 @@ class MrosRgbdReader:
     self.sync_queue_size = int(sync_queue_size)
     self.sync_slop_sec = float(sync_slop_sec)
     self.frame_timeout_sec = float(frame_timeout_sec)
+    self.disconnect_timeout_sec = float(disconnect_timeout_sec)
     self.node_name = str(node_name)
     self.reliable = bool(reliable)
 
@@ -219,6 +222,8 @@ class MrosRgbdReader:
       raise ValueError("depth_scale must be positive")
     if self.frame_timeout_sec <= 0.0:
       raise ValueError("frame_timeout_sec must be positive")
+    if self.disconnect_timeout_sec <= 0.0 or not math.isfinite(self.disconnect_timeout_sec):
+      raise ValueError("disconnect_timeout_sec must be positive and finite")
     if not self.node_name:
       raise ValueError("node_name must not be empty")
 
@@ -226,6 +231,7 @@ class MrosRgbdReader:
         queue_size=self.sync_queue_size,
         slop_sec=self.sync_slop_sec,
     )
+    self._message_condition = threading.Condition()
     self._mros = None
     self._color_subscriber = None
     self._depth_subscriber = None
@@ -235,6 +241,7 @@ class MrosRgbdReader:
     self._stopping = False
     self._last_error_log_time = 0.0
     self._last_timeout_log_time = 0.0
+    self._last_synchronized_frame_monotonic = None
 
   @classmethod
   def from_camera_config(cls, camera_config: dict) -> "MrosRgbdReader":
@@ -252,6 +259,7 @@ class MrosRgbdReader:
         sync_queue_size=int(mros_config.get("sync_queue_size", 10)),
         sync_slop_sec=float(mros_config.get("sync_slop_sec", 0.03)),
         frame_timeout_sec=float(mros_config.get("frame_timeout_sec", 5.0)),
+        disconnect_timeout_sec=float(mros_config.get("disconnect_timeout_sec", 3.0)),
         node_name=str(mros_config.get("reader_node_name", "foundationpose_rgbd_reader")),
         reliable=bool(mros_config.get("reliable", False)),
     )
@@ -267,16 +275,40 @@ class MrosRgbdReader:
           "mROS camera input is enabled, but the mROS Python package is unavailable"
       ) from exc
 
+    with self._message_condition:
+      self._synchronizer = ApproximateImageSynchronizer(
+        queue_size=self.sync_queue_size,
+        slop_sec=self.sync_slop_sec,
+      )
+      self._camera_info = None
+      self._stopping = False
+      self._last_synchronized_frame_monotonic = None
+
     mros.init(self.node_name)
     try:
       self._color_subscriber = mros.subscribe(
-          self.color_topic, Image, None, self.sync_queue_size, False, self.reliable
+        self.color_topic,
+        Image,
+        self._handle_color_message,
+        self.sync_queue_size,
+        False,
+        self.reliable,
       )
       self._depth_subscriber = mros.subscribe(
-          self.depth_topic, Image, None, self.sync_queue_size, False, self.reliable
+        self.depth_topic,
+        Image,
+        self._handle_depth_message,
+        self.sync_queue_size,
+        False,
+        self.reliable,
       )
       self._camera_info_subscriber = mros.subscribe(
-          self.camera_info_topic, CameraInfo, None, 1, True, self.reliable
+        self.camera_info_topic,
+        CameraInfo,
+        self._handle_camera_info_message,
+        1,
+        True,
+        self.reliable,
       )
     except Exception:
       mros.shutdown()
@@ -284,7 +316,6 @@ class MrosRgbdReader:
 
     self._mros = mros
     self._started = True
-    self._stopping = False
     print("[mROS RGB-D] Subscriptions started")
     print(f"  color: {self.color_topic}")
     print(f"  aligned depth: {self.depth_topic}")
@@ -295,7 +326,9 @@ class MrosRgbdReader:
   def stop(self) -> None:
     if not self._started:
       return
-    self._stopping = True
+    with self._message_condition:
+      self._stopping = True
+      self._message_condition.notify_all()
     try:
       if self._mros is not None:
         self._mros.shutdown()
@@ -305,38 +338,71 @@ class MrosRgbdReader:
       self._camera_info_subscriber = None
       self._mros = None
       self._started = False
+      with self._message_condition:
+        self._camera_info = None
+        self._last_synchronized_frame_monotonic = None
 
   def get_frame(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
     if not self._started:
       raise RuntimeError("MrosRgbdReader.get_frame() called before start()")
     deadline = time.monotonic() + self.frame_timeout_sec
-    while not self._stopping:
+    while True:
       if self._mros is None or not self._mros.ok():
         raise RuntimeError("mROS stopped while waiting for RGB-D input")
-      try:
-        camera_info = self._camera_info_subscriber.readMsgRT()
-        if camera_info is not None:
-          self._validate_camera_info_size(camera_info)
-          self._camera_info = camera_info
-        color_message = self._color_subscriber.readMsgRT()
-        if color_message is not None:
-          self._synchronizer.add_color(color_message)
-        depth_message = self._depth_subscriber.readMsgRT()
-        if depth_message is not None:
-          self._synchronizer.add_depth(depth_message)
+      with self._message_condition:
+        if self._stopping:
+          return None
+        camera_info = self._camera_info
+        match = self._synchronizer.pop_match() if camera_info is not None else None
+        if match is None:
+          remaining = deadline - time.monotonic()
+          if remaining > 0.0:
+            self._message_condition.wait(timeout=remaining)
+            continue
 
-        match = self._synchronizer.pop_match()
-        if match is not None and self._camera_info is not None:
-          return self._convert_frame(match[0], match[1], self._camera_info)
-      except Exception as exc:
-        self._log_error(exc)
+      if match is not None and camera_info is not None:
+        try:
+          frame = self._convert_frame(match[0], match[1], camera_info)
+          self._last_synchronized_frame_monotonic = time.monotonic()
+          return frame
+        except Exception as exc:
+          self._log_error(exc)
+          continue
 
-      remaining = deadline - time.monotonic()
-      if remaining <= 0.0:
-        self._log_timeout()
-        return None
-      time.sleep(min(0.001, remaining))
-    return None
+      self._raise_if_disconnected()
+      self._log_timeout()
+      return None
+
+  def _handle_color_message(self, message) -> None:
+    try:
+      with self._message_condition:
+        if self._stopping:
+          return
+        self._synchronizer.add_color(message)
+        self._message_condition.notify_all()
+    except Exception as exc:
+      self._log_error(exc)
+
+  def _handle_depth_message(self, message) -> None:
+    try:
+      with self._message_condition:
+        if self._stopping:
+          return
+        self._synchronizer.add_depth(message)
+        self._message_condition.notify_all()
+    except Exception as exc:
+      self._log_error(exc)
+
+  def _handle_camera_info_message(self, message) -> None:
+    try:
+      self._validate_camera_info_size(message)
+      with self._message_condition:
+        if self._stopping:
+          return
+        self._camera_info = message
+        self._message_condition.notify_all()
+    except Exception as exc:
+      self._log_error(exc)
 
   def _convert_frame(self, color_message, depth_message, camera_info):
     color = _color_image_to_rgb(color_message)
@@ -377,6 +443,20 @@ class MrosRgbdReader:
     print(
         f"[mROS RGB-D] No synchronized frame received for {self.frame_timeout_sec:.1f} s; "
         "check publishers, topic names, reliability, CameraInfo, and RGB/depth timestamps"
+    )
+
+  def _raise_if_disconnected(self) -> None:
+    last_frame_time = self._last_synchronized_frame_monotonic
+    if last_frame_time is None:
+      return
+    elapsed = time.monotonic() - last_frame_time
+    if elapsed < self.disconnect_timeout_sec:
+      return
+    raise TimeoutError(
+        f"mROS RGB-D stream disconnected: no synchronized frame for {elapsed:.1f} s "
+        f"after streaming started (limit={self.disconnect_timeout_sec:.1f} s); "
+        "check publisher health, subscriber counts, topic names, reliability, "
+        "CameraInfo, and RGB/depth timestamps"
     )
 
 

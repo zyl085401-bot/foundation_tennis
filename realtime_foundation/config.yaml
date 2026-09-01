@@ -28,6 +28,8 @@ camera:
     sync_queue_size: 10
     sync_slop_sec: 0.03
     frame_timeout_sec: 5.0
+    # 首帧由startup_timeout_sec保护；开始出流后连续无同步帧达到此时长则报错退出。
+    disconnect_timeout_sec: 3.0
     reliable: false
     bridge_cpu_cores: [0, 1]
     model_cpu_cores: [2, 3]
@@ -79,9 +81,9 @@ pose_mros:
 yolo:
   precision: int8             # int8|fp16；当前使用 tennis INT8 engine。
   io_precision: int8          # int8|fp32；INT8输入启用GPU整数预处理，失败时回退FP32输入INT8网络。
-  int8_io_weights: realtime_foundation/yolo_weights1/tennis_best_480x640_int8_io_trt104.engine
-  int8_weights: realtime_foundation/yolo_weights1/tennis_best_480x640_int8_trt104.engine
-  weights: realtime_foundation/yolo_weights1/tennis_best_480x640_trt104.engine
+  int8_io_weights: realtime_foundation/yolo_weights/tennis1_best_480x640_int8_io_trt104.engine
+  int8_weights: realtime_foundation/yolo_weights/tennis1_best_480x640_int8_trt104.engine
+  weights: realtime_foundation/yolo_weights/tennis1_best_480x640_trt104.engine
   fallback_to_fp32_io: true
   fallback_to_fp16: true
   int8_input_dynamic_range: 1.0  # normalized RGB [0,1]；必须与INT8 I/O Engine构建参数一致。

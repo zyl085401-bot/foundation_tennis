@@ -386,8 +386,8 @@ class MrosPosePublisher:
       self._latest_wheelarm_quaternion_xyzw = quaternion_xyzw
       self._latest_wheelarm_update_monotonic = time.monotonic()
       self._wheelarm_stale_reported = False
-    self._publish_wheelarm_base_pose(base_pose, data, stamp=stamp)
-    self._publish_wheelarm_data(data)
+      self._publish_wheelarm_base_pose(base_pose, data, stamp=stamp)
+      self._publish_wheelarm_data(data)
     return list(data)
 
   def _publish_wheelarm_base_pose(self, base_pose: np.ndarray, wheelarm_data, stamp=None) -> None:
@@ -423,14 +423,13 @@ class MrosPosePublisher:
   def _wheelarm_publish_loop(self) -> None:
     period_sec = 1.0 / self.wheelarm_publish_rate_hz
     while not self._wheelarm_stop_event.wait(period_sec):
-      data = None
       expired = False
       with self._wheelarm_lock:
         updated_at = self._latest_wheelarm_update_monotonic
         if self._latest_wheelarm_data is not None and updated_at is not None:
           age_sec = time.monotonic() - updated_at
           if age_sec <= self.wheelarm_stale_timeout_sec:
-            data = list(self._latest_wheelarm_data)
+            self._publish_wheelarm_data(self._latest_wheelarm_data)
           elif not self._wheelarm_stale_reported:
             self._wheelarm_stale_reported = True
             expired = True
@@ -439,8 +438,6 @@ class MrosPosePublisher:
             f"[WheelArm] Latest target exceeded {self.wheelarm_stale_timeout_sec:g}s; "
             "publishing paused until the next valid pose"
         )
-      if data is not None:
-        self._publish_wheelarm_data(data)
 
   def _publish_wheelarm_data(self, data) -> None:
     publisher = self._wheelarm_publisher

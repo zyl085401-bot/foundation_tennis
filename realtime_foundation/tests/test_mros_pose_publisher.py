@@ -1,5 +1,7 @@
 import math
 from types import SimpleNamespace
+import threading
+import time
 import unittest
 
 import numpy as np
@@ -92,6 +94,18 @@ class FakePublisher:
 
   def getNumSubscribers(self):
     return self.subscriber_count
+
+
+class BlockingFakePublisher(FakePublisher):
+  def __init__(self):
+    super().__init__()
+    self.publish_started = threading.Event()
+    self.publish_release = threading.Event()
+
+  def publish(self, message):
+    self.publish_started.set()
+    self.publish_release.wait(timeout=1.0)
+    super().publish(message)
 
 
 class FakeTransformBroadcaster:
@@ -333,6 +347,61 @@ class MrosPosePublisherTest(unittest.TestCase):
         data[:3],
         atol=1e-7,
     )
+
+  def test_clear_wheelarm_target_stops_republishing_latest_pose(self):
+    publisher = MrosPosePublisher({
+        "enabled": True,
+        "wheelarm_target": {
+            "enabled": True,
+        },
+    })
+    publisher._latest_wheelarm_data = [1.0] * 7
+    publisher._latest_wheelarm_update_monotonic = 10.0
+    publisher._latest_wheelarm_quaternion_xyzw = (0.0, 0.0, 0.0, 1.0)
+    publisher._wheelarm_stale_reported = True
+
+    publisher.clear_wheelarm_target()
+
+    self.assertIsNone(publisher._latest_wheelarm_data)
+    self.assertIsNone(publisher._latest_wheelarm_update_monotonic)
+    self.assertIsNone(publisher._latest_wheelarm_quaternion_xyzw)
+    self.assertFalse(publisher._wheelarm_stale_reported)
+
+  def test_clear_waits_for_inflight_publish_and_prevents_later_stale_publish(self):
+    publisher = MrosPosePublisher({
+        "enabled": True,
+        "wheelarm_target": {
+            "enabled": True,
+            "publish_rate_hz": 1000.0,
+            "stale_timeout_sec": 10.0,
+        },
+    })
+    publisher._Float32MultiArray = FakeFloat32MultiArray
+    publisher._wheelarm_publisher = BlockingFakePublisher()
+    publisher._latest_wheelarm_data = [1.0] * 7
+    publisher._latest_wheelarm_update_monotonic = time.monotonic()
+    publisher._wheelarm_stop_event.clear()
+    publish_thread = threading.Thread(target=publisher._wheelarm_publish_loop)
+    clear_finished = threading.Event()
+    clear_thread = threading.Thread(
+        target=lambda: (publisher.clear_wheelarm_target(), clear_finished.set())
+    )
+    publish_thread.start()
+    try:
+      self.assertTrue(publisher._wheelarm_publisher.publish_started.wait(timeout=1.0))
+      clear_thread.start()
+      self.assertFalse(clear_finished.wait(timeout=0.02))
+      publisher._wheelarm_publisher.publish_release.set()
+      self.assertTrue(clear_finished.wait(timeout=1.0))
+      published_after_clear = len(publisher._wheelarm_publisher.messages)
+      time.sleep(0.02)
+      self.assertEqual(len(publisher._wheelarm_publisher.messages), published_after_clear)
+    finally:
+      publisher._wheelarm_publisher.publish_release.set()
+      publisher._wheelarm_stop_event.set()
+      publish_thread.join(timeout=1.0)
+      if clear_thread.is_alive():
+        clear_thread.join(timeout=1.0)
 
 
 if __name__ == "__main__":

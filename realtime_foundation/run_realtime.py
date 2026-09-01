@@ -2210,6 +2210,7 @@ def main() -> None:
             if missing_detection_count >= max_missing_detections:
               yolo_worker.pause()
               try:
+                pose_publisher.clear_wheelarm_target()
                 tracker.reset()
                 last_detection = None
                 missing_detection_count = 0
@@ -2242,6 +2243,7 @@ def main() -> None:
         try:
           pose_result = tracker.track(color, depth, K)
         except Exception as exc:
+          pose_publisher.clear_wheelarm_target()
           yolo_worker.pause()
           try:
             tracker.reset()
@@ -2279,6 +2281,7 @@ def main() -> None:
               )
               if missing_detection_count >= max_missing_detections:
                 last_detection = None
+                pose_publisher.clear_wheelarm_target()
                 log_runtime(verbose_runtime, f"[Realtime] Frame {frame_index}: target lost, stop FoundationPose tracking and wait for YOLO detection")
                 reset_tracker_after_record = True
               else:
@@ -2302,8 +2305,9 @@ def main() -> None:
 
       if pose_output is not None:
         save_pose(pose_output, pose_result.pose)
-      pose_publisher.publish_pose(pose_result.pose)
-      pose_publisher.update_wheelarm_target(pose_result.pose)
+      if not reset_tracker_after_record:
+        pose_publisher.publish_pose(pose_result.pose)
+        pose_publisher.update_wheelarm_target(pose_result.pose)
 
       should_record_pose = record_writer is not None and (
           (pose_result.mode == "register" and record_save_register)
@@ -2357,6 +2361,7 @@ def main() -> None:
         continue
 
       if reset_tracker_after_record:
+        pose_publisher.clear_wheelarm_target()
         yolo_worker.pause()
         try:
           tracker.reset()
@@ -2376,6 +2381,7 @@ def main() -> None:
   except TerminationRequested as exc:
     print(f"[Realtime] {exc}; stopping")
   except Exception as exc:
+    pose_publisher.clear_wheelarm_target()
     if tracker.initialized:
       pose_publisher.publish_status(
           f"LOST: tracking aborted by runtime failure; {type(exc).__name__}: {exc}"
