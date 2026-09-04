@@ -348,6 +348,134 @@ class MrosPosePublisherTest(unittest.TestCase):
         atol=1e-7,
     )
 
+  def test_wheelarm_orientation_override_keeps_xyz_and_uses_fixed_wxyz(self):
+    publisher = MrosPosePublisher({
+        "enabled": True,
+        "wheelarm_target": {
+            "enabled": True,
+            "target_frame": "base_Link",
+            "base_from_camera": np.eye(4),
+            "override_orientation": True,
+            "fixed_orientation_wxyz": [0.7, 0.0, 0.7, 0.0],
+        },
+    })
+    self.mark_started(publisher)
+    publisher._Float32MultiArray = FakeFloat32MultiArray
+    publisher._PoseStamped = FakePoseStamped
+    publisher._wheelarm_publisher = FakePublisher()
+    publisher._wheelarm_base_pose_publisher = FakePublisher()
+    pose = np.array([
+        [0.0, -1.0, 0.0, 0.6],
+        [1.0, 0.0, 0.0, 0.2],
+        [0.0, 0.0, 1.0, 0.4],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+
+    data = publisher.update_wheelarm_target(pose)
+
+    np.testing.assert_allclose(data, (0.6, 0.2, 0.4, 0.7, 0.0, 0.7, 0.0), atol=1e-7)
+    target_message = publisher._wheelarm_publisher.messages[0]
+    np.testing.assert_allclose(
+        target_message.data,
+        (0.6, 0.2, 0.4, 0.7, 0.0, 0.7, 0.0),
+        atol=1e-7,
+    )
+    pose_message = publisher._wheelarm_base_pose_publisher.messages[0]
+    np.testing.assert_allclose(
+        (
+            pose_message.pose.orientation.w,
+            pose_message.pose.orientation.x,
+            pose_message.pose.orientation.y,
+            pose_message.pose.orientation.z,
+        ),
+        (0.7, 0.0, 0.7, 0.0),
+        atol=1e-7,
+    )
+
+  def test_wheelarm_orientation_override_disabled_preserves_pose_rotation(self):
+    publisher = MrosPosePublisher({
+        "enabled": True,
+        "wheelarm_target": {
+            "enabled": True,
+            "base_from_camera": np.eye(4),
+            "override_orientation": False,
+            "fixed_orientation_wxyz": [0.7, 0.0, 0.7, 0.0],
+        },
+    })
+    self.mark_started(publisher)
+    publisher._Float32MultiArray = FakeFloat32MultiArray
+    publisher._PoseStamped = FakePoseStamped
+    publisher._wheelarm_publisher = FakePublisher()
+    publisher._wheelarm_base_pose_publisher = FakePublisher()
+    pose = np.array([
+        [0.0, -1.0, 0.0, 0.6],
+        [1.0, 0.0, 0.0, 0.2],
+        [0.0, 0.0, 1.0, 0.4],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+
+    data = publisher.update_wheelarm_target(pose)
+
+    expected = (0.6, 0.2, 0.4, math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5))
+    np.testing.assert_allclose(data, expected, atol=1e-7)
+
+  def test_wheelarm_position_z_override_keeps_xy_and_uses_fixed_z(self):
+    publisher = MrosPosePublisher({
+        "enabled": True,
+        "wheelarm_target": {
+            "enabled": True,
+            "target_frame": "base_Link",
+            "base_from_camera": np.eye(4),
+            "override_position_z": True,
+            "fixed_position_z_m": 0.5,
+        },
+    })
+    self.mark_started(publisher)
+    publisher._Float32MultiArray = FakeFloat32MultiArray
+    publisher._PoseStamped = FakePoseStamped
+    publisher._wheelarm_publisher = FakePublisher()
+    publisher._wheelarm_base_pose_publisher = FakePublisher()
+    pose = np.eye(4)
+    pose[:3, 3] = (0.6, 0.2, 0.4)
+
+    data = publisher.update_wheelarm_target(pose)
+
+    np.testing.assert_allclose(data[:3], (0.6, 0.2, 0.5), atol=1e-7)
+    target_message = publisher._wheelarm_publisher.messages[0]
+    np.testing.assert_allclose(target_message.data[:3], (0.6, 0.2, 0.5), atol=1e-7)
+    pose_message = publisher._wheelarm_base_pose_publisher.messages[0]
+    np.testing.assert_allclose(
+        (
+            pose_message.pose.position.x,
+            pose_message.pose.position.y,
+            pose_message.pose.position.z,
+        ),
+        (0.6, 0.2, 0.5),
+        atol=1e-7,
+    )
+
+  def test_wheelarm_fixed_position_z_requires_finite_value(self):
+    with self.assertRaisesRegex(ValueError, "fixed_position_z_m"):
+      MrosPosePublisher({
+          "enabled": True,
+          "wheelarm_target": {
+              "enabled": True,
+              "fixed_position_z_m": float("nan"),
+          },
+      })
+
+  def test_wheelarm_fixed_orientation_requires_four_finite_values(self):
+    for value in ([0.7, 0.0, 0.7], [0.7, 0.0, float("nan"), 0.0]):
+      with self.subTest(value=value):
+        with self.assertRaisesRegex(ValueError, "fixed_orientation_wxyz"):
+          MrosPosePublisher({
+              "enabled": True,
+              "wheelarm_target": {
+                  "enabled": True,
+                  "fixed_orientation_wxyz": value,
+              },
+          })
+
   def test_clear_wheelarm_target_stops_republishing_latest_pose(self):
     publisher = MrosPosePublisher({
         "enabled": True,

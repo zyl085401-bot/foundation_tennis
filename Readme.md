@@ -32,15 +32,20 @@ bash FoundationPose/docker/run_jetson_telemetry.sh
 ###################################################################################################
 # 在外部x86主机连接NX上的mROS Agent。
 export MROS_AGENT_URI=tcp://192.168.55.2:11315
+export MROS_LOCALHOST_ONLY=0
 mrostopic list
 
 
 source /home/nvidia/jason/bbs/install/setup.bash
 export MROS_AGENT_IP=192.168.55.2
+export MROS_LOCALHOST_ONLY=0
 mrosagent
 
-# 在基础容器里启动相机发布器 启动RealSense并通过mROS发布彩色、对齐深度和相机内参话题
-cd /home/nvidia/workspace/yolo_foundationpose_ball_20hz
+# 可选：仅当 RealSense 直接连接本机且没有外部相机发布者时，才启动此发布容器。
+# 当前使用外部 /chest/... 相机话题时不要执行这一段。
+cd /home/guest/eillen/yolo_foundationpose_ball_20hz
+export MROS_AGENT_URI=tcp://192.168.55.2:11315
+export MROS_LOCALHOST_ONLY=0
 
 CONTAINER_NAME=foundationpose-mros-camera \
 bash FoundationPose/docker/run_container_jetson.sh \
@@ -51,7 +56,9 @@ python3 realtime_foundation/camera/depth_color_publish \
 export DISPLAY=:0
 xhost +si:localuser:root
 
-cd ~/workspace/yolo_foundationpose_ball_20hz
+cd /home/guest/eillen/yolo_foundationpose_ball_20hz
+export MROS_AGENT_URI=tcp://192.168.55.2:11315
+export MROS_LOCALHOST_ONLY=0
 
 bash FoundationPose/docker/run_container_jetson.sh \
   python3 realtime_foundation/run_realtime.py \

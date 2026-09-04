@@ -35,6 +35,23 @@ if [[ -n "${DISPLAY:-}" && -d /tmp/.X11-unix ]]; then
   )
 fi
 
+MROS_LOCALHOST_ONLY="${MROS_LOCALHOST_ONLY:-0}"
+MROS_ARGS=()
+for variable in \
+    MROS_AGENT_URI \
+    MROS_AGENT_IP \
+    MROS_LOCALHOST_ONLY \
+    MROS_IP_LIST \
+    MROS_DOMAIN_ID \
+    MROS_DISCOVERY_SERVER; do
+  if [[ -n "${!variable:-}" ]]; then
+    MROS_ARGS+=(--env "${variable}=${!variable}")
+  fi
+done
+if [[ -z "${MROS_AGENT_URI:-}" ]]; then
+  echo "WARNING: MROS_AGENT_URI is unset; remote mROS topics may be unavailable." >&2
+fi
+
 if [[ $# -eq 0 ]]; then
   COMMAND=(bash)
 else
@@ -58,6 +75,7 @@ exec "${DOCKER[@]}" run --rm "${TTY_ARGS[@]}" \
   --env TORCH_CUDA_ARCH_LIST=8.7 \
   --env OPENCV_IO_ENABLE_OPENEXR=1 \
   --env PYTHONUNBUFFERED=1 \
+  "${MROS_ARGS[@]}" \
   "${DISPLAY_ARGS[@]}" \
   "${IMAGE_NAME}" \
   "${COMMAND[@]}"

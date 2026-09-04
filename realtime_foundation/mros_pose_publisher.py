@@ -69,6 +69,35 @@ class MrosPosePublisher:
     self.wheelarm_publish_static_tf = bool(wheelarm_config.get("publish_static_tf", False))
     self.wheelarm_publish_rate_hz = float(wheelarm_config.get("publish_rate_hz", 20.0))
     self.wheelarm_stale_timeout_sec = float(wheelarm_config.get("stale_timeout_sec", 1.0))
+    self.wheelarm_override_position_z = bool(
+      wheelarm_config.get("override_position_z", False)
+    )
+    self.wheelarm_fixed_position_z_m = float(
+      wheelarm_config.get("fixed_position_z_m", 0.0)
+    )
+    if not math.isfinite(self.wheelarm_fixed_position_z_m):
+      raise ValueError(
+        "pose_mros.wheelarm_target.fixed_position_z_m must be finite"
+      )
+    self.wheelarm_override_orientation = bool(
+        wheelarm_config.get("override_orientation", False)
+    )
+    fixed_orientation_wxyz = np.asarray(
+        wheelarm_config.get("fixed_orientation_wxyz", (0.7, 0.0, 0.7, 0.0)),
+        dtype=np.float64,
+    )
+    if fixed_orientation_wxyz.size != 4:
+      raise ValueError(
+          "pose_mros.wheelarm_target.fixed_orientation_wxyz must contain 4 values"
+      )
+    fixed_orientation_wxyz = fixed_orientation_wxyz.reshape(4)
+    if not np.isfinite(fixed_orientation_wxyz).all():
+      raise ValueError(
+          "pose_mros.wheelarm_target.fixed_orientation_wxyz contains NaN or Inf"
+      )
+    self.wheelarm_fixed_orientation_wxyz = tuple(
+        float(value) for value in fixed_orientation_wxyz
+    )
     self.wheelarm_queue_size = _positive_queue_size(
         wheelarm_config.get("queue_size", 1),
         "wheelarm_target.queue_size",
@@ -251,6 +280,16 @@ class MrosPosePublisher:
           f"({self.wheelarm_source_frame} -> {self.wheelarm_target_frame}, "
           f"stale={self.wheelarm_stale_timeout_sec:g}s)"
       )
+      if self.wheelarm_override_orientation:
+        print(
+            "  wheelarm orientation override (wxyz): "
+            f"{self.wheelarm_fixed_orientation_wxyz}"
+        )
+      if self.wheelarm_override_position_z:
+        print(
+            "  wheelarm position Z override (base_Link, meters): "
+            f"{self.wheelarm_fixed_position_z_m:g}"
+        )
       print(
           f"  wheelarm base pose: {self.wheelarm_base_pose_topic} "
           f"({self.wheelarm_target_frame})"
@@ -382,6 +421,12 @@ class MrosPosePublisher:
           base_pose,
           previous_quaternion_xyzw=self._latest_wheelarm_quaternion_xyzw,
       )
+      if self.wheelarm_override_position_z:
+        data[2] = self.wheelarm_fixed_position_z_m
+      if self.wheelarm_override_orientation:
+        qw, qx, qy, qz = self.wheelarm_fixed_orientation_wxyz
+        data[3:] = (qw, qx, qy, qz)
+        quaternion_xyzw = (qx, qy, qz, qw)
       self._latest_wheelarm_data = data
       self._latest_wheelarm_quaternion_xyzw = quaternion_xyzw
       self._latest_wheelarm_update_monotonic = time.monotonic()
@@ -404,9 +449,9 @@ class MrosPosePublisher:
     message.header.seq = self._take_sequence("_wheelarm_base_pose_sequence")
     message.header.stamp = self._resolve_stamp(stamp)
     message.header.frame_id = self.wheelarm_target_frame
-    message.pose.position.x = float(matrix[0, 3])
-    message.pose.position.y = float(matrix[1, 3])
-    message.pose.position.z = float(matrix[2, 3])
+    message.pose.position.x = float(data[0])
+    message.pose.position.y = float(data[1])
+    message.pose.position.z = float(data[2])
     message.pose.orientation.x = qx
     message.pose.orientation.y = qy
     message.pose.orientation.z = qz

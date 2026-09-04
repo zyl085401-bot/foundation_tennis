@@ -11,8 +11,8 @@ camera:
 
   mros:
     # sensormanager发布原始、未对齐的RGB-D；接收端按下方静态标定完成Depth->Color对齐。
-    color_topic: /tron2/color
-    depth_topic: /tron2/depth
+    color_topic: /chest/color/image_raw
+    depth_topic: /chest/aligned_depth_to_color/image_raw
     camera_info_topic: null
     publisher_node_name: foundationpose_rgbd_publisher
     publisher_queue_size: 2
@@ -36,7 +36,7 @@ camera:
 
     depth_to_color_alignment:
       # 生产环境必须开启；关闭时原始Depth仅用于A/B调试，与Color/K的几何关系无效。
-      enabled: true
+      enabled: false
       backend: opencv_rgbd
       depth_dilation: false
 
@@ -119,6 +119,12 @@ pose_mros:
     publish_static_tf: false
     publish_rate_hz: 20.0
     stale_timeout_sec: 1.0
+    # true：保留base_Link下的XY，但将Z固定为下方手动值；false：使用FoundationPose转换后的Z。
+    override_position_z: true
+    fixed_position_z_m: 0.5
+    # true：保留base_Link下的XYZ，但用下方固定wxyz替换FoundationPose旋转；false：发送完整转换姿态。
+    override_orientation: true
+    fixed_orientation_wxyz: [0.7, 0.0, 0.7, 0.0]
     queue_size: 1
     base_from_camera:
       - [0.0, -0.6427661390, 0.766062459, 0.22117]
